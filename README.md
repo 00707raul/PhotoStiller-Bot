@@ -1,51 +1,54 @@
-# PhotoStiller Telethon v6
+# PhotoStiller Telethon v7
 
-Telegram bot for:
+Telegram image downloader bot with:
 
-1. Downloading direct image URLs.
-2. Downloading photos from Telegram public channels.
-3. Downloading photos from private invite links when `STRING_SESSION` is configured.
-4. Optional public mode so everyone can use the bot.
+- Direct image URL download
+- Telegram channel photo history download
+- Public mode support
+- Private invite link support through `STRING_SESSION`
+- Live editable progress bar with percentage
+- Automatic deletion of temporary progress message after delivery
+
+## Important Telegram link rules
+
+Use real Telegram links:
+
+```text
+/download https://t.me/channelusername
+/download @channelusername
+/download https://t.me/+PRIVATE_INVITE_HASH
+```
+
+Do **not** use browser-only links like:
+
+```text
+https://web.telegram.org/k/#-2918294579
+```
+
+Those are internal Telegram Web links and cannot be resolved by Telethon. Open the channel in Telegram and copy the real `t.me` link.
 
 ## Render start command
 
-```bash
+```text
 python bot.py
 ```
 
-## Required Render environment variables
+## Render build command
 
-```env
-API_ID=your_api_id
-API_HASH=your_api_hash
-BOT_TOKEN=your_bot_token
-OWNER_ID=your_numeric_telegram_user_id
-```
-
-## User session for private invite links
-
-Private invite links such as `https://t.me/+XXXX` need a user session:
-
-```env
-STRING_SESSION=your_telethon_string_session
-```
-
-Generate it locally:
-
-```bash
+```text
 pip install -r requirements.txt
-python generate_session.py
 ```
 
-## Make the bot public
-
-To let anyone use the bot, add this in Render:
+## Required env
 
 ```env
-PUBLIC_MODE=true
+API_ID=36948049
+API_HASH=your_api_hash_here
+BOT_TOKEN=your_new_bot_token_here
+OWNER_ID=5147519186
 ```
 
-Recommended safe public settings:
+## Recommended env for public mode
 
 ```env
 PUBLIC_MODE=true
@@ -53,46 +56,50 @@ ALLOW_PRIVATE_LINKS_FOR_PUBLIC=false
 MAX_ACTIVE_JOBS=2
 ```
 
-With this setup:
+## Private invite links
 
-- anyone can send direct image URLs;
-- anyone can download images from public Telegram channels;
-- only the owner can use private invite links;
-- `/cleanup` and `/sessionstatus` stay owner-only.
+Generate your user session locally:
 
-## Dangerous option
+```bash
+python generate_session.py
+```
 
-This allows public users to use your `STRING_SESSION`/Telegram user account for private invite links:
+Then add this to Render:
 
 ```env
-ALLOW_PRIVATE_LINKS_FOR_PUBLIC=true
+STRING_SESSION=your_long_string_session_here
 ```
 
-Use it only if you fully trust your users.
+Keep `ALLOW_PRIVATE_LINKS_FOR_PUBLIC=false` unless you want strangers to use your user session for private links.
 
-## Commands
+## Progress bar
+
+The bot now edits one live progress message approximately every second:
 
 ```text
-/start
-/help
-/download https://t.me/channelname
-/status
-/cancel
-/pause
-/cleanup
-/sessionstatus
+██████░░░░░░░░░░░░ 33.0%
+330/1000 photos processed
 ```
 
-## Example usage
+After the ZIP/file is delivered, the temporary progress message is deleted automatically.
 
-```text
-/download https://t.me/SomePublicChannel
+Optional setting:
+
+```env
+PROGRESS_EDIT_INTERVAL_SECONDS=1
 ```
 
-Or send only:
+## Other env
 
-```text
-https://t.me/SomePublicChannel
+```env
+MAX_CONCURRENT_DOWNLOADS=5
+PROGRESS_UPDATE_INTERVAL=50
+PROGRESS_EDIT_INTERVAL_SECONDS=1
+MAX_RETRIES=3
+DOWNLOAD_TIMEOUT=30
+MAX_STORAGE_GB=10
+MAX_IMAGE_MB=50
+MAX_URLS_PER_MESSAGE=5
+REQUEST_TIMEOUT=25
+TELEGRAM_ZIP_LIMIT_MB=2000
 ```
-
-Then press **Start Download**.

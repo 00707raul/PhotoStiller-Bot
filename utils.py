@@ -44,6 +44,19 @@ def extract_urls(text: str) -> List[str]:
     return cleaned
 
 
+
+def is_web_telegram_url(value: str) -> bool:
+    """web.telegram.org links are browser-internal links, not real Telegram channel links.
+
+    Example: https://web.telegram.org/k/#-2918294579 cannot be resolved by Telethon.
+    Users must send a real t.me link or @username.
+    """
+    try:
+        parsed = urlparse(value if "://" in value else "https://" + value)
+        return parsed.netloc.lower() == "web.telegram.org"
+    except Exception:
+        return False
+
 def is_telegram_channel_link(value: str) -> bool:
     value = (value or "").strip()
     if value.startswith("@"):

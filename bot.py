@@ -33,6 +33,7 @@ from utils import (
     extract_urls,
     is_telegram_channel_link,
     is_valid_http_url,
+    is_web_telegram_url,
     normalize_channel_input,
 )
 
@@ -154,6 +155,7 @@ t.me/SomeChannel
 https://t.me/+PRIVATE_INVITE_LINK
 https://t.me/joinchat/PRIVATE_INVITE_HASH
 
+Do not send web.telegram.org browser links. Use a real t.me link or @username.
 Private invite links need STRING_SESSION in Render env.
 """.strip()
 
@@ -172,6 +174,8 @@ Private invite links:
 `/download https://t.me/+XXXX`
 
 For private invite links, the bot must have `STRING_SESSION` in Render env. This lets your own Telegram user account read/join the channel while the bot sends the ZIP back to you.
+
+Important: `web.telegram.org/...` links are browser-internal links and cannot be downloaded. Copy the real `https://t.me/...` link or send `@channelusername`.
 
 Use:
 /status - progress
@@ -250,6 +254,10 @@ async def download_handler(event):
         return
 
     channel_link = normalize_channel_input(channel_link)
+    if is_web_telegram_url(channel_link):
+        await event.reply("❌ This is a web.telegram.org browser link. It is not a real channel link. Open the channel → Share/Copy Link and send `https://t.me/...` or `@channelusername`.", parse_mode="md")
+        return
+
     if not is_telegram_channel_link(channel_link):
         await event.reply("❌ Invalid channel link. Use https://t.me/channel, t.me/+invite, t.me/joinchat/hash, or @channel")
         return
@@ -320,6 +328,10 @@ async def text_handler(event):
         return
 
     urls = extract_urls(text)
+    if urls and any(is_web_telegram_url(url) for url in urls):
+        await event.reply("❌ `web.telegram.org/...` links are only browser links. I cannot read channel history from that. Send a real Telegram link like `https://t.me/channelname`, `https://t.me/+invite`, or `@channelname`.", parse_mode="md")
+        return
+
     if not urls:
         await event.reply("Send a direct image URL or use `/download <channel_link>`.", parse_mode="md")
         return
