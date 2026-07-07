@@ -67,11 +67,35 @@ def normalize_channel_input(value: str) -> str:
     return value
 
 
+def _folder_size_bytes(path: Path) -> int:
+    """Return only the size of the bot download folder, not the whole server disk."""
+    if not path.exists():
+        return 0
+
+    total = 0
+    for file_path in path.rglob("*"):
+        try:
+            if file_path.is_file():
+                total += file_path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 def has_enough_disk_space() -> bool:
+    """Check Render disk safely.
+
+    The old version compared MAX_STORAGE_GB with the whole Linux filesystem usage.
+    On Render that includes system files, so it could fail even when the bot folder was empty.
+    This version checks:
+    1) at least 0.5 GB real free disk remains;
+    2) only ./downloads is below MAX_STORAGE_GB.
+    """
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(DOWNLOAD_ROOT)
     free_gb = usage.free / (1024 ** 3)
-    return free_gb >= 0.5 and (usage.used / (1024 ** 3)) < MAX_STORAGE_GB
+    downloads_gb = _folder_size_bytes(DOWNLOAD_ROOT) / (1024 ** 3)
+    return free_gb >= 0.5 and downloads_gb < MAX_STORAGE_GB
 
 
 def make_photo_path(folder: Path, message_id: int) -> Path:

@@ -101,6 +101,7 @@ Commands:
 /status - show current progress
 /cancel - stop current download
 /pause - pause or resume current download
+/cleanup - delete temporary downloaded files
 /help - usage instructions
 
 Channel link formats:
@@ -129,6 +130,7 @@ Use:
 /status - progress
 /cancel - stop
 /pause - pause/resume
+/cleanup - clear temporary server downloads
 
 Only the OWNER_ID from Render env can use this bot.
 """.strip()
@@ -164,6 +166,21 @@ async def cancel_handler(event):
 async def pause_handler(event):
     text = await downloader.toggle_pause(event.sender_id)
     await event.reply(text)
+
+
+
+
+@client.on(events.NewMessage(pattern=r"^/cleanup$"))
+@owner_only
+async def cleanup_handler(event):
+    active_job = downloader.get_job(event.sender_id)
+    if active_job and active_job.status in {"validating", "running", "paused", "delivering"}:
+        await event.reply("❌ A download is active. Use /cancel first, then /cleanup.")
+        return
+
+    cleanup_paths([DOWNLOAD_ROOT])
+    ensure_dirs()
+    await event.reply("✅ Cleanup complete. Temporary download files were deleted.")
 
 
 @client.on(events.NewMessage(pattern=r"^/download(?:\s+(.+))?$"))

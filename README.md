@@ -203,3 +203,8 @@ Render Free can sleep. This project includes a `/health` page, but polling bots 
 https://your-render-app.onrender.com/health
 ```
 
+
+
+## v4 storage fix
+
+This version fixes the Render disk-space check. It checks only the `downloads/` folder size against `MAX_STORAGE_GB`, instead of comparing against the whole Render filesystem usage. It also adds `/cleanup` to clear temporary downloaded files.
