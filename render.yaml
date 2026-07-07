@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: photostiller-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: MAX_IMAGE_MB
+        value: "10"
