@@ -1,210 +1,98 @@
-# PhotoStiller Bot - Telethon Version
+# PhotoStiller Telethon v6
 
-This version keeps the original direct image URL downloader and adds a new mechanic:
+Telegram bot for:
 
-**Telegram channel image downloader** using **Telethon / MTProto**.
+1. Downloading direct image URLs.
+2. Downloading photos from Telegram public channels.
+3. Downloading photos from private invite links when `STRING_SESSION` is configured.
+4. Optional public mode so everyone can use the bot.
 
-The bot can:
+## Render start command
 
-- Download direct image URLs.
-- Accept Telegram channel links.
-- Scan channel history for photos only.
-- Download all channel photos.
-- Save progress in SQLite.
-- Resume incomplete downloads after restart when files still exist.
-- Create a ZIP archive and send it to the owner.
-- Send albums in batches if ZIP is too large.
-- Support `/status`, `/cancel`, `/pause`, inline buttons, and owner-only access.
-
----
-
-## Project files
-
-```text
-PhotoStiller-Telethon-v3/
-├── bot.py
-├── channel_downloader.py
-├── config.py
-├── database.py
-├── logger_setup.py
-├── utils.py
-├── requirements.txt
-├── Procfile
-├── render.yaml
-├── runtime.txt
-├── .python-version
-├── .env.example
-├── .gitignore
-└── README.md
-```
-
----
-
-## Important Telegram rule
-
-For channel history downloading, add **PhotoStiller_bot** as an **admin** in the target Telegram channel first.
-
-The bot will reject the job with:
-
-```text
-This bot must be added as an admin to this channel to read history.
-```
-
-For private channels/invite links, the bot must already have access. Bots normally cannot join private invite links by themselves like a normal user.
-
----
-
-## Environment variables for Render
-
-Add these in **Render → Environment → Add Environment Variable**:
-
-```env
-API_ID=your_api_id_from_my_telegram_org
-API_HASH=your_api_hash_from_my_telegram_org
-BOT_TOKEN=your_new_photostiller_bot_token
-OWNER_ID=your_numeric_telegram_user_id
-MAX_CONCURRENT_DOWNLOADS=5
-PROGRESS_UPDATE_INTERVAL=50
-MAX_RETRIES=3
-DOWNLOAD_TIMEOUT=30
-MAX_STORAGE_GB=10
-MAX_IMAGE_MB=10
-MAX_URLS_PER_MESSAGE=5
-REQUEST_TIMEOUT=25
-TELEGRAM_ZIP_LIMIT_MB=2000
-```
-
-Do **not** add webhook variables. This bot uses polling through Telethon.
-
----
-
-## Where to get API_ID and API_HASH
-
-1. Open `https://my.telegram.org/apps`
-2. Log in with your Telegram account.
-3. Create an app.
-4. Copy:
-   - `api_id`
-   - `api_hash`
-
----
-
-## Where to get OWNER_ID
-
-Open Telegram and message:
-
-```text
-@userinfobot
-```
-
-Copy your numeric Telegram ID and put it as:
-
-```env
-OWNER_ID=123456789
-```
-
-Only this user can use the bot.
-
----
-
-## Render settings
-
-Use:
-
-```text
-Build Command:
-pip install -r requirements.txt
-```
-
-```text
-Start Command:
+```bash
 python bot.py
 ```
 
-The bot starts a small Flask health page on `/health`, so Render can see that the service is alive.
+## Required Render environment variables
 
----
+```env
+API_ID=your_api_id
+API_HASH=your_api_hash
+BOT_TOKEN=your_bot_token
+OWNER_ID=your_numeric_telegram_user_id
+```
+
+## User session for private invite links
+
+Private invite links such as `https://t.me/+XXXX` need a user session:
+
+```env
+STRING_SESSION=your_telethon_string_session
+```
+
+Generate it locally:
+
+```bash
+pip install -r requirements.txt
+python generate_session.py
+```
+
+## Make the bot public
+
+To let anyone use the bot, add this in Render:
+
+```env
+PUBLIC_MODE=true
+```
+
+Recommended safe public settings:
+
+```env
+PUBLIC_MODE=true
+ALLOW_PRIVATE_LINKS_FOR_PUBLIC=false
+MAX_ACTIVE_JOBS=2
+```
+
+With this setup:
+
+- anyone can send direct image URLs;
+- anyone can download images from public Telegram channels;
+- only the owner can use private invite links;
+- `/cleanup` and `/sessionstatus` stay owner-only.
+
+## Dangerous option
+
+This allows public users to use your `STRING_SESSION`/Telegram user account for private invite links:
+
+```env
+ALLOW_PRIVATE_LINKS_FOR_PUBLIC=true
+```
+
+Use it only if you fully trust your users.
 
 ## Commands
 
 ```text
 /start
-```
-Welcome message.
-
-```text
 /help
-```
-Show usage instructions.
-
-```text
-/download https://t.me/SomeChannel
-```
-Validate channel and show a Start Download button.
-
-```text
+/download https://t.me/channelname
 /status
-```
-Show current progress.
-
-```text
 /cancel
-```
-Cancel current download.
-
-```text
 /pause
+/cleanup
+/sessionstatus
 ```
-Pause or resume current download.
 
----
-
-## Link formats accepted
+## Example usage
 
 ```text
-https://t.me/SomeChannel
-t.me/SomeChannel
-@SomeChannel
-https://t.me/joinchat/XXXX
-https://t.me/+XXXX
+/download https://t.me/SomePublicChannel
 ```
 
-Private invite links only work if the bot already has access.
-
----
-
-## Direct image URL downloader
-
-You can still send direct image links like:
+Or send only:
 
 ```text
-https://example.com/image.jpg
+https://t.me/SomePublicChannel
 ```
 
-The bot downloads and sends the image back.
-
-For webpage links, the bot tries to find `og:image` preview images, but some websites block server requests.
-
----
-
-## Safety
-
-Never upload your `.env` file to GitHub.
-
-If you pasted your token anywhere public, revoke only **PhotoStiller_bot** token in **@BotFather**, then add the new token to Render.
-
----
-
-## Notes for free hosting
-
-Render Free can sleep. This project includes a `/health` page, but polling bots work best on always-on hosting. If Render sleeps, use an uptime monitor to ping:
-
-```text
-https://your-render-app.onrender.com/health
-```
-
-
-
-## v4 storage fix
-
-This version fixes the Render disk-space check. It checks only the `downloads/` folder size against `MAX_STORAGE_GB`, instead of comparing against the whole Render filesystem usage. It also adds `/cleanup` to clear temporary downloaded files.
+Then press **Start Download**.

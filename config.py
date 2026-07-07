@@ -21,11 +21,30 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 # Telegram / Telethon credentials
 API_ID = _int_env("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = _int_env("OWNER_ID", 0)
+
+# Access control
+# PUBLIC_MODE=false keeps the bot private for OWNER_ID only.
+# PUBLIC_MODE=true lets everyone use the bot for direct image URLs and public channels.
+# Keep ALLOW_PRIVATE_LINKS_FOR_PUBLIC=false unless you knowingly want strangers to use
+# your STRING_SESSION/user account to open private invite links.
+PUBLIC_MODE = _bool_env("PUBLIC_MODE", False)
+ALLOW_PRIVATE_LINKS_FOR_PUBLIC = _bool_env("ALLOW_PRIVATE_LINKS_FOR_PUBLIC", False)
+MAX_ACTIVE_JOBS = _int_env("MAX_ACTIVE_JOBS", 2)
+
+# Optional user account session.
+# Needed for private invite links like https://t.me/+XXXX because Telegram bot accounts
+# cannot call some invite/history methods through MTProto.
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 
 # Download configuration
 MAX_CONCURRENT_DOWNLOADS = _int_env("MAX_CONCURRENT_DOWNLOADS", 5)

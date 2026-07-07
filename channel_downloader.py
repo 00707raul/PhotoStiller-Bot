@@ -13,15 +13,17 @@ from telethon.errors import (
     InviteHashExpiredError,
     InviteHashInvalidError,
     RPCError,
+    UserAlreadyParticipantError,
 )
-from telethon.tl.functions.channels import GetParticipantRequest
-from telethon.tl.types import Channel, ChannelParticipantAdmin, ChannelParticipantCreator, InputMessagesFilterPhotos
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import Chat, Channel, InputMessagesFilterPhotos
 
 from config import (
     ALBUM_BATCH_SIZE,
     DOWNLOAD_ROOT,
     DOWNLOAD_TIMEOUT,
     MAX_CONCURRENT_DOWNLOADS,
+    MAX_ACTIVE_JOBS,
     MAX_RETRIES,
     PROGRESS_UPDATE_INTERVAL,
     TELEGRAM_ZIP_LIMIT_BYTES,
@@ -30,6 +32,7 @@ from database import DownloadDB
 from utils import (
     cleanup_paths,
     create_zip,
+    extract_invite_hash,
     format_eta,
     has_enough_disk_space,
     make_photo_path,
@@ -58,39 +61,74 @@ class DownloadJob:
 
 
 class ChannelImageDownloader:
-    def __init__(self, client, db: DownloadDB, logger):
-        self.client = client
+    """Download Telegram channel photos.
+
+    bot_client is used to talk with the user.
+    reader_client is used to read/download channel history.
+
+    If reader_client is a user session, private invite links can work.
+    If reader_client is the bot client, private invite links cannot work because Telegram
+    restricts bot accounts from using invite-link MTProto methods.
+    """
+
+    def __init__(self, bot_client, reader_client, db: DownloadDB, logger, uses_user_session: bool = False):
+        self.bot_client = bot_client
+        self.reader_client = reader_client
         self.db = db
         self.logger = logger
+        self.uses_user_session = uses_user_session
         self.jobs: Dict[int, DownloadJob] = {}
 
     def get_job(self, user_id: int) -> Optional[DownloadJob]:
         return self.jobs.get(user_id)
 
+    async def _resolve_invite_link(self, invite_hash: str):
+        if not self.uses_user_session:
+            raise PermissionError(
+                "Private invite links require STRING_SESSION. Add your Telegram user session to Render env first."
+            )
+
+        try:
+            result = await self.reader_client(ImportChatInviteRequest(invite_hash))
+            if getattr(result, "chats", None):
+                return result.chats[0]
+        except UserAlreadyParticipantError:
+            try:
+                invite = await self.reader_client(CheckChatInviteRequest(invite_hash))
+                chat = getattr(invite, "chat", None)
+                if chat:
+                    return chat
+            except Exception:
+                pass
+            # Last fallback: Telethon may resolve an already-joined invite link directly.
+            return await self.reader_client.get_entity(f"https://t.me/+{invite_hash}")
+        except (InviteHashInvalidError, InviteHashExpiredError, InviteHashEmptyError):
+            raise PermissionError("This private invite link is invalid or expired.")
+        except RPCError as exc:
+            raise PermissionError(f"Cannot join/open this private invite link: {exc}")
+
+        raise PermissionError("Could not open this private invite link. It may require join approval or be expired.")
+
     async def validate_channel(self, channel_input: str):
         normalized = normalize_channel_input(channel_input)
+        invite_hash = extract_invite_hash(normalized)
+
         try:
-            entity = await self.client.get_entity(normalized)
+            if invite_hash:
+                entity = await self._resolve_invite_link(invite_hash)
+            else:
+                entity = await self.reader_client.get_entity(normalized)
+        except PermissionError:
+            raise
         except (ChannelPrivateError, InviteHashInvalidError, InviteHashExpiredError, InviteHashEmptyError):
-            raise PermissionError("Channel is private or inaccessible. Add the bot as an admin first.")
+            if self.uses_user_session:
+                raise PermissionError("Channel is private or inaccessible for your user session.")
+            raise PermissionError("Channel is private or inaccessible. Add STRING_SESSION or add the bot to the channel.")
         except (ChannelInvalidError, ValueError, RPCError) as exc:
             raise ValueError(f"Invalid or inaccessible channel link: {exc}")
 
-        if not isinstance(entity, Channel):
-            raise ValueError("This link does not look like a Telegram channel.")
-
-        # The user explicitly wants admin-only channel history reading.
-        # Public channels may be readable without admin, but we enforce admin access for safety and private-channel reliability.
-        me = await self.client.get_me()
-        try:
-            participant = await self.client(GetParticipantRequest(channel=entity, participant=me.id))
-            participant_type = type(participant.participant)
-            if participant_type not in (ChannelParticipantAdmin, ChannelParticipantCreator):
-                raise PermissionError("This bot must be added as an admin to this channel to read history.")
-        except PermissionError:
-            raise
-        except Exception:
-            raise PermissionError("This bot must be added as an admin to this channel to read history.")
+        if not isinstance(entity, (Channel, Chat)):
+            raise ValueError("This link does not look like a Telegram channel/group.")
 
         return entity
 
@@ -98,8 +136,12 @@ class ChannelImageDownloader:
         if user_id in self.jobs and self.jobs[user_id].status in {"validating", "running", "paused", "delivering"}:
             return "A download is already running. Use /status or /cancel first."
 
+        active_jobs = [job for job in self.jobs.values() if job.status in {"validating", "running", "paused", "delivering"}]
+        if len(active_jobs) >= MAX_ACTIVE_JOBS:
+            return f"Server is busy. Maximum active downloads reached ({MAX_ACTIVE_JOBS}). Try again later."
+
         if not has_enough_disk_space():
-            return "Not enough disk space or storage limit reached. Clean the server storage first."
+            return "Not enough disk space or storage limit reached. Use /cleanup first."
 
         job = DownloadJob(user_id=user_id, channel_input=channel_input)
         self.jobs[user_id] = job
@@ -127,20 +169,21 @@ class ChannelImageDownloader:
         if job.status == "running":
             job.status = "paused"
             job.pause_event.clear()
-            return "Download paused. Press Resume or use /pause again."
+            return "Download paused. Use /pause again to resume."
         return f"Cannot pause/resume while status is {job.status}."
 
     def status_text(self, user_id: int) -> str:
         job = self.jobs.get(user_id)
         if not job:
-            db_job = self.db.get_job(user_id)
-            if db_job:
-                channel_key, status, downloaded_count, total_seen, updated_at = db_job
+            saved = self.db.get_job(user_id)
+            if saved:
+                channel_key, status, downloaded_count, total_seen, updated_at = saved
                 return (
-                    f"Last job: {status}\n"
-                    f"Channel: {channel_key or 'unknown'}\n"
-                    f"Downloaded: {downloaded_count}\n"
-                    f"Messages seen: {total_seen}\n"
+                    "No active download. Last saved job:\n"
+                    f"Channel: {channel_key}\n"
+                    f"Status: {status}\n"
+                    f"Images downloaded: {downloaded_count}\n"
+                    f"Messages scanned: {total_seen}\n"
                     f"Updated: {updated_at}"
                 )
             return "No active download."
@@ -161,7 +204,7 @@ class ChannelImageDownloader:
         zip_path: Optional[Path] = None
 
         try:
-            await self.client.send_message(user_id, "Validating channel access...")
+            await self.bot_client.send_message(user_id, "Validating channel access...")
             entity = await self.validate_channel(job.channel_input)
 
             channel_key = safe_name(getattr(entity, "username", None) or getattr(entity, "title", None) or str(entity.id))
@@ -171,9 +214,12 @@ class ChannelImageDownloader:
             job.status = "running"
             self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
 
-            await self.client.send_message(
+            reader_mode = "user session" if self.uses_user_session else "bot session"
+            await self.bot_client.send_message(
                 user_id,
-                f"✅ Channel validated: {getattr(entity, 'title', channel_key)}\nStarting image scan...",
+                f"✅ Channel validated: {getattr(entity, 'title', channel_key)}\n"
+                f"Reader: {reader_mode}\n"
+                "Starting image scan...",
                 buttons=[[Button.inline("Cancel", data=b"cancel"), Button.inline("Pause", data=b"pause")]],
             )
 
@@ -181,7 +227,7 @@ class ChannelImageDownloader:
             pending = []
             last_progress = 0
 
-            async for message in self.client.iter_messages(entity, filter=InputMessagesFilterPhotos):
+            async for message in self.reader_client.iter_messages(entity, filter=InputMessagesFilterPhotos):
                 if job.cancel_event.is_set():
                     raise asyncio.CancelledError()
 
@@ -222,25 +268,25 @@ class ChannelImageDownloader:
 
             if job.downloaded_count == 0:
                 job.status = "finished"
-                await self.client.send_message(user_id, "No new images found in this channel.")
+                await self.bot_client.send_message(user_id, "No new images found in this channel.")
                 return
 
             job.status = "delivering"
             self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.client.send_message(user_id, f"Creating ZIP archive with {job.downloaded_count} images...")
+            await self.bot_client.send_message(user_id, f"Creating ZIP archive with {job.downloaded_count} images...")
 
             zip_path = create_zip(job.folder)
             zip_size = zip_path.stat().st_size if zip_path.exists() else 0
 
             if zip_size <= TELEGRAM_ZIP_LIMIT_BYTES:
-                await self.client.send_file(
+                await self.bot_client.send_file(
                     user_id,
                     str(zip_path),
                     caption=f"✅ Done. Downloaded {job.downloaded_count} images from {channel_key}.",
                     force_document=True,
                 )
             else:
-                await self.client.send_message(
+                await self.bot_client.send_message(
                     user_id,
                     "ZIP is too large, sending images in batches of 10 instead...",
                 )
@@ -248,21 +294,21 @@ class ChannelImageDownloader:
 
             job.status = "finished"
             self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.client.send_message(user_id, "Cleanup complete. Server storage has been cleared.")
+            await self.bot_client.send_message(user_id, "Cleanup complete. Server storage has been cleared.")
 
         except asyncio.CancelledError:
             job.status = "cancelled"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.client.send_message(user_id, f"Cancelled. Downloaded before cancel: {job.downloaded_count} images.")
+            await self.bot_client.send_message(user_id, f"Cancelled. Downloaded before cancel: {job.downloaded_count} images.")
         except PermissionError as exc:
             job.status = "failed"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.client.send_message(user_id, f"❌ {exc}")
+            await self.bot_client.send_message(user_id, f"❌ {exc}")
         except Exception as exc:
             self.logger.exception("Download failed")
             job.status = "failed"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.client.send_message(user_id, f"❌ Download failed: {exc}")
+            await self.bot_client.send_message(user_id, f"❌ Download failed: {exc}")
         finally:
             if job.status in {"finished", "cancelled", "failed"}:
                 cleanup = []
@@ -309,7 +355,7 @@ class ChannelImageDownloader:
     async def _maybe_progress(self, user_id: int, job: DownloadJob, last_progress: int) -> None:
         if job.downloaded_count and job.downloaded_count - last_progress >= PROGRESS_UPDATE_INTERVAL:
             eta = format_eta(job.downloaded_count, job.started_at, None)
-            await self.client.send_message(
+            await self.bot_client.send_message(
                 user_id,
                 f"Downloaded {job.downloaded_count} images so far...\nETA: {eta}",
                 buttons=[[Button.inline("Cancel", data=b"cancel"), Button.inline("Pause/Resume", data=b"pause")]],
@@ -320,9 +366,9 @@ class ChannelImageDownloader:
         for i in range(0, len(images), ALBUM_BATCH_SIZE):
             batch = images[i : i + ALBUM_BATCH_SIZE]
             try:
-                await self.client.send_file(user_id, batch, album=True)
+                await self.bot_client.send_file(user_id, batch, album=True)
             except Exception:
                 # Fallback one-by-one if album upload fails.
                 for image in batch:
-                    await self.client.send_file(user_id, image)
+                    await self.bot_client.send_file(user_id, image)
             await asyncio.sleep(1)

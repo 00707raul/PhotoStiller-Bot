@@ -67,6 +67,38 @@ def normalize_channel_input(value: str) -> str:
     return value
 
 
+def extract_invite_hash(value: str) -> Optional[str]:
+    """Return invite hash for t.me/+HASH or t.me/joinchat/HASH links."""
+    value = (value or "").strip().rstrip(".,;!?)\n\r\t")
+    if not value:
+        return None
+
+    normalized = value
+    if normalized.startswith("t.me/") or normalized.startswith("telegram.me/"):
+        normalized = "https://" + normalized
+
+    try:
+        parsed = urlparse(normalized)
+    except Exception:
+        return None
+
+    if parsed.netloc.lower() not in {"t.me", "telegram.me"}:
+        return None
+
+    path = parsed.path.strip("/")
+    if not path:
+        return None
+
+    if path.startswith("+") and len(path) > 1:
+        return path[1:]
+
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[0].lower() == "joinchat" and parts[1]:
+        return parts[1]
+
+    return None
+
+
 def _folder_size_bytes(path: Path) -> int:
     """Return only the size of the bot download folder, not the whole server disk."""
     if not path.exists():
