@@ -1,361 +1,303 @@
 import asyncio
-import html
-import ipaddress
-import os
-import re
-import socket
-import tempfile
+import secrets
 import threading
-from urllib.parse import urljoin, urlparse
+from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
 from flask import Flask
-from telegram import MessageEntity, Update
-from telegram.constants import ChatAction
-from telegram.error import TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon import Button, TelegramClient, events
+from telethon.errors import RPCError
 
-load_dotenv()
+from channel_downloader import ChannelImageDownloader
+from config import (
+    API_HASH,
+    API_ID,
+    BOT_TOKEN,
+    DATA_DIR,
+    DOWNLOAD_ROOT,
+    MAX_URLS_PER_MESSAGE,
+    OWNER_ID,
+    PORT,
+    SESSION_NAME,
+)
+from database import DownloadDB
+from logger_setup import setup_logging
+from utils import (
+    cleanup_paths,
+    download_direct_image,
+    ensure_dirs,
+    extract_og_image,
+    extract_urls,
+    is_telegram_channel_link,
+    is_valid_http_url,
+    normalize_channel_input,
+)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
-MAX_IMAGE_SIZE = MAX_IMAGE_MB * 1024 * 1024
-MAX_URLS_PER_MESSAGE = int(os.getenv("MAX_URLS_PER_MESSAGE", "5"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
-PORT = int(os.getenv("PORT", "10000"))
+logger = setup_logging()
+db = DownloadDB()
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+downloader = ChannelImageDownloader(client, db, logger)
+pending_channel_links = {}
 
-# Keep parentheses inside URLs because many CDN links use things like format(webp).
-URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
-HTML_READ_LIMIT = 2 * 1024 * 1024
+
+def make_start_button(channel_link: str):
+    key = secrets.token_urlsafe(8)
+    pending_channel_links[key] = channel_link
+    return Button.inline("Start Download", data=f"start:{key}".encode("utf-8"))
 
 health_app = Flask(__name__)
 
 
-@health_app.get("/")
-def home():
-    return "PhotoStiller bot is running in polling mode."
+@health_app.route("/")
+def index():
+    return "PhotoStiller bot is running."
 
 
-@health_app.get("/health")
+@health_app.route("/health")
 def health():
-    return {"ok": True, "mode": "polling"}
+    return {"status": "ok", "bot": "PhotoStiller"}
 
 
-def run_health_server() -> None:
-    """Small HTTP server for Render/Koyeb health checks. This is NOT a Telegram webhook."""
+def run_health_server():
     health_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
-def clean_url(url: str) -> str:
-    """Remove punctuation copied after a URL without breaking valid CDN URLs."""
-    url = (url or "").strip()
-
-    # Common sentence punctuation is almost never part of the actual URL.
-    while url and url[-1] in ".,;!?":
-        url = url[:-1]
-
-    # Remove closing brackets only when they are extra wrappers around the URL.
-    pairs = [("(", ")"), ("[", "]"), ("{", "}")]
-    changed = True
-    while changed:
-        changed = False
-        for opener, closer in pairs:
-            if url.endswith(closer) and url.count(closer) > url.count(opener):
-                url = url[:-1]
-                changed = True
-
-    return url
+def check_config() -> None:
+    missing = []
+    if not API_ID:
+        missing.append("API_ID")
+    if not API_HASH:
+        missing.append("API_HASH")
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not OWNER_ID:
+        missing.append("OWNER_ID")
+    if missing:
+        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 
-def extract_urls_from_message(message) -> list[str]:
-    urls: list[str] = []
-    text = message.text or message.caption or ""
+def owner_only(func):
+    async def wrapper(event):
+        sender_id = event.sender_id
+        if sender_id != OWNER_ID:
+            await event.reply("❌ This bot is private. You are not allowed to use it.")
+            logger.warning("Blocked unauthorized user: %s", sender_id)
+            return
+        return await func(event)
 
-    # Telegram already knows the exact URL entity, so use it first.
-    try:
-        entities = message.parse_entities(types=[MessageEntity.URL, MessageEntity.TEXT_LINK]) or {}
-        for entity, value in entities.items():
-            if entity.type == MessageEntity.URL:
-                urls.append(value)
-            elif entity.type == MessageEntity.TEXT_LINK and entity.url:
-                urls.append(entity.url)
-    except Exception:
-        pass
-
-    # Fallback regex for normal text.
-    urls.extend(URL_RE.findall(text))
-
-    cleaned = [clean_url(u) for u in urls]
-    cleaned = [u for u in cleaned if u]
-
-    # Keep order but remove duplicates.
-    return list(dict.fromkeys(cleaned))[:MAX_URLS_PER_MESSAGE]
+    return wrapper
 
 
-def is_public_hostname(hostname: str) -> bool:
-    """Block localhost/private IPs so the bot cannot be abused to access internal services."""
-    if not hostname:
-        return False
+START_TEXT = """
+👩‍💻 **PhotoStiller Bot**
 
-    try:
-        addresses = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
+I can download images in two ways:
 
-    for item in addresses:
-        ip = ipaddress.ip_address(item[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            return False
+1) Send me a direct image URL and I will download it.
+2) Send a Telegram channel link and use `/download <channel_link>` to download all photos from that channel history.
 
-    return True
+Commands:
+/start - welcome message
+/download <channel_link> - download all channel photos
+/status - show current progress
+/cancel - stop current download
+/pause - pause or resume current download
+/help - usage instructions
 
+Channel link formats:
+https://t.me/SomeChannel
+t.me/SomeChannel
+@SomeChannel
+private invite link if the bot already has access
 
-def validate_url(url: str) -> None:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Invalid URL. Please send a normal http/https image link.")
-    if not is_public_hostname(parsed.hostname or ""):
-        raise ValueError("This URL is not allowed.")
+Important: for channel history downloads, add this bot as an admin to the channel first.
+""".strip()
 
 
-def get_response(url: str, *, stream: bool) -> requests.Response:
-    """Open URL safely, following a few redirects manually."""
-    current_url = url
+HELP_TEXT = """
+**How to use**
 
-    for _ in range(5):
-        validate_url(current_url)
+Direct image:
+Send any direct image URL like:
+`https://site.com/image.jpg`
 
-        response = requests.get(
-            current_url,
-            stream=stream,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=False,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; PhotoStillerBot/1.0)",
-                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            },
-        )
+Channel images:
+`/download https://t.me/SomeChannel`
 
-        if response.is_redirect or response.is_permanent_redirect:
-            location = response.headers.get("Location")
-            response.close()
-            if not location:
-                raise ValueError("Redirect without location header.")
-            current_url = urljoin(current_url, location)
-            continue
+The bot will scan message history, download photos only, create a ZIP, send it to you, then clean server storage.
 
-        response.raise_for_status()
-        validate_url(response.url)
-        return response
+Use:
+/status - progress
+/cancel - stop
+/pause - pause/resume
 
-    raise ValueError("Too many redirects.")
+Only the OWNER_ID from Render env can use this bot.
+""".strip()
 
 
-def extension_from_content_type(content_type: str) -> str:
-    subtype = content_type.split("/", 1)[-1].split(";", 1)[0].lower().strip()
-    mapping = {
-        "jpeg": "jpg",
-        "jpg": "jpg",
-        "png": "png",
-        "webp": "webp",
-        "gif": "gif",
-        "bmp": "bmp",
-        "svg+xml": "svg",
-    }
-    return mapping.get(subtype, "img")
+@client.on(events.NewMessage(pattern=r"^/start$"))
+@owner_only
+async def start_handler(event):
+    await event.reply(START_TEXT, buttons=[[Button.url("Open BotFather", "https://t.me/BotFather")]], parse_mode="md")
 
 
-def extract_meta_image(page_url: str, html_text: str) -> str | None:
-    """Try to get image previews from normal web pages like Pinterest/share links."""
-    patterns = [
-        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
-        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
-        r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
-        r'<link[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\']image_src["\']',
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, html_text, flags=re.IGNORECASE)
-        if match:
-            image_url = html.unescape(match.group(1).strip())
-            return urljoin(page_url, image_url)
-
-    return None
+@client.on(events.NewMessage(pattern=r"^/help$"))
+@owner_only
+async def help_handler(event):
+    await event.reply(HELP_TEXT, parse_mode="md")
 
 
-def save_image_response(response: requests.Response) -> tuple[str, str]:
-    try:
-        content_type = response.headers.get("Content-Type", "").lower()
-        if not content_type.startswith("image/"):
-            raise ValueError("This link is not a direct image link and no preview image was found.")
-
-        content_length = int(response.headers.get("Content-Length", "0") or 0)
-        if content_length > MAX_IMAGE_SIZE:
-            raise ValueError(f"Image is too large. Max size is {MAX_IMAGE_MB} MB.")
-
-        extension = extension_from_content_type(content_type)
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}") as file:
-            total = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_IMAGE_SIZE:
-                    raise ValueError(f"Image is too large. Max size is {MAX_IMAGE_MB} MB.")
-                file.write(chunk)
-            return file.name, content_type
-    finally:
-        response.close()
+@client.on(events.NewMessage(pattern=r"^/status$"))
+@owner_only
+async def status_handler(event):
+    await event.reply(downloader.status_text(event.sender_id))
 
 
-def download_image(url: str) -> tuple[str, str, str]:
-    """Download a direct image URL, or try a page's preview image as fallback."""
-    response = get_response(url, stream=True)
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    if content_type.startswith("image/"):
-        path, image_type = save_image_response(response)
-        return path, image_type, url
-
-    # It is not a direct image. Try to read the page and find og:image/twitter:image.
-    response.close()
-    page_response = get_response(url, stream=False)
-    try:
-        page_type = page_response.headers.get("Content-Type", "").lower()
-        if "html" not in page_type:
-            raise ValueError("This link is not a direct image link.")
-
-        html_text = page_response.text[:HTML_READ_LIMIT]
-        image_url = extract_meta_image(page_response.url, html_text)
-        if not image_url:
-            raise ValueError("This link is not a direct image link and no preview image was found.")
-    finally:
-        page_response.close()
-
-    image_response = get_response(image_url, stream=True)
-    path, image_type = save_image_response(image_response)
-    return path, image_type, image_url
+@client.on(events.NewMessage(pattern=r"^/cancel$"))
+@owner_only
+async def cancel_handler(event):
+    text = await downloader.cancel(event.sender_id)
+    await event.reply(text)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "👩‍💻 Hi, I am PhotoStiller.\n\n"
-        "Send me a direct image URL or a page link that contains an image preview.\n\n"
-        "Examples:\n"
-        "https://example.com/image.jpg\n"
-        "https://pin.it/example"
-    )
+@client.on(events.NewMessage(pattern=r"^/pause$"))
+@owner_only
+async def pause_handler(event):
+    text = await downloader.toggle_pause(event.sender_id)
+    await event.reply(text)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Send one or more image links.\n\n"
-        f"Max image size: {MAX_IMAGE_MB} MB\n"
-        f"Max links per message: {MAX_URLS_PER_MESSAGE}\n\n"
-        "Works best with direct JPG, PNG, WEBP, GIF links. "
-        "For normal web pages, I will try to extract the preview image."
-    )
-
-
-async def send_downloaded_file(message, chat_id: int, temp_path: str, content_type: str) -> None:
-    with open(temp_path, "rb") as image_file:
-        try:
-            if "gif" in content_type or "svg" in content_type:
-                await message.get_bot().send_document(
-                    chat_id=chat_id,
-                    document=image_file,
-                    caption="Downloaded image ✅",
-                    connect_timeout=30,
-                    read_timeout=90,
-                    write_timeout=90,
-                    pool_timeout=30,
-                )
-            else:
-                await message.get_bot().send_photo(
-                    chat_id=chat_id,
-                    photo=image_file,
-                    caption="Downloaded image ✅",
-                    connect_timeout=30,
-                    read_timeout=90,
-                    write_timeout=90,
-                    pool_timeout=30,
-                )
-        except TimedOut:
-            # Fallback: Telegram photo upload sometimes times out on free hosts.
-            image_file.seek(0)
-            await message.get_bot().send_document(
-                chat_id=chat_id,
-                document=image_file,
-                caption="Downloaded image ✅",
-                connect_timeout=30,
-                read_timeout=120,
-                write_timeout=120,
-                pool_timeout=30,
-            )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    urls = extract_urls_from_message(message)
-
-    if not urls:
-        await message.reply_text("Please send an image URL.")
+@client.on(events.NewMessage(pattern=r"^/download(?:\s+(.+))?$"))
+@owner_only
+async def download_handler(event):
+    channel_link = event.pattern_match.group(1)
+    if not channel_link:
+        await event.reply("Usage: `/download https://t.me/SomeChannel`", parse_mode="md")
         return
 
-    for url in urls:
-        temp_path = None
+    channel_link = normalize_channel_input(channel_link)
+    if not is_telegram_channel_link(channel_link):
+        await event.reply("❌ Invalid channel link. Use https://t.me/channel, t.me/channel, or @channel")
+        return
+
+    await event.reply(
+        f"Channel detected:\n`{channel_link}`\n\nPress Start Download to begin.",
+        buttons=[
+            [make_start_button(channel_link)],
+            [Button.inline("Cancel", data=b"cancel")],
+        ],
+        parse_mode="md",
+    )
+
+
+@client.on(events.CallbackQuery)
+async def callback_handler(event):
+    if event.sender_id != OWNER_ID:
+        await event.answer("Not allowed", alert=True)
+        return
+
+    data = event.data.decode("utf-8", errors="ignore")
+
+    if data.startswith("start:"):
+        key = data.split(":", 1)[1]
+        channel_link = pending_channel_links.pop(key, None)
+        if not channel_link:
+            await event.answer("This download button expired. Send the channel link again.", alert=True)
+            return
+        await event.answer("Starting...")
+        text = await downloader.start_download(event.sender_id, channel_link)
+        await event.edit(text)
+        return
+
+    if data == "cancel":
+        await event.answer("Cancelling...")
+        text = await downloader.cancel(event.sender_id)
+        await event.respond(text)
+        return
+
+    if data == "pause":
+        await event.answer("Updating...")
+        text = await downloader.toggle_pause(event.sender_id)
+        await event.respond(text)
+        return
+
+
+@client.on(events.NewMessage)
+@owner_only
+async def text_handler(event):
+    text = event.raw_text or ""
+    if text.startswith("/"):
+        return
+
+    urls = extract_urls(text)
+    if not urls:
+        await event.reply("Send a direct image URL or use `/download <channel_link>`.", parse_mode="md")
+        return
+
+    # If the user sends a Telegram channel link without /download, offer a button.
+    channel_links = [normalize_channel_input(url) for url in urls if is_telegram_channel_link(normalize_channel_input(url))]
+    if channel_links:
+        channel_link = channel_links[0]
+        await event.reply(
+            f"Telegram channel link detected:\n`{channel_link}`\n\nPress Start Download to download all photos.",
+            buttons=[
+                [make_start_button(channel_link)],
+                [Button.inline("Cancel", data=b"cancel")],
+            ],
+            parse_mode="md",
+        )
+        return
+
+    selected = urls[:MAX_URLS_PER_MESSAGE]
+    temp_folder = DOWNLOAD_ROOT / "direct_urls" / str(event.sender_id)
+    temp_folder.mkdir(parents=True, exist_ok=True)
+    downloaded_paths = []
+
+    await event.reply(f"Found {len(selected)} URL(s). Downloading...")
+
+    for url in selected:
+        if not is_valid_http_url(url):
+            await event.reply(f"❌ Invalid URL:\n{url}")
+            continue
+
         try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
-            temp_path, content_type, used_url = await asyncio.to_thread(download_image, url)
-            await send_downloaded_file(message, update.effective_chat.id, temp_path, content_type)
+            image_url = url
+            try:
+                image_path = await download_direct_image(image_url, temp_folder)
+            except Exception:
+                og_image = await extract_og_image(url)
+                if not og_image:
+                    raise
+                image_url = og_image
+                image_path = await download_direct_image(image_url, temp_folder)
 
-            if used_url != url:
-                await message.reply_text(f"Source image found from page:\n{used_url}")
-
+            downloaded_paths.append(image_path)
+            await client.send_file(event.chat_id, str(image_path), caption="✅ Downloaded image")
         except Exception as exc:
-            await message.reply_text(f"❌ Failed to download:\n{url}\n\nReason: {exc}")
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
+            await event.reply(f"❌ Failed to download:\n{url}\n\nReason: {exc}")
+            logger.warning("Direct URL download failed for %s: %s", url, exc)
+
+    cleanup_paths(downloaded_paths)
 
 
-def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Add it in environment variables.")
+async def main():
+    check_config()
+    ensure_dirs()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Start a simple HTTP health server so free web hosts can run this as a web service.
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(90)
-        .write_timeout(90)
-        .pool_timeout(30)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, handle_message))
-
-    print("PhotoStiller bot is running with polling...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting PhotoStiller Telethon bot...")
+    await client.start(bot_token=BOT_TOKEN)
+    me = await client.get_me()
+    logger.info("Bot started as @%s", getattr(me, "username", "unknown"))
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
+    except RPCError as exc:
+        logger.exception("Telegram RPC error: %s", exc)
+        raise

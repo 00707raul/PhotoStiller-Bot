@@ -1,117 +1,205 @@
-# PhotoStiller Telegram Bot - Polling Version
+# PhotoStiller Bot - Telethon Version
 
-This bot uses Telegram **polling**, not webhook.
+This version keeps the original direct image URL downloader and adds a new mechanic:
 
-It accepts direct image URL links, downloads the image, and sends it back in Telegram.
+**Telegram channel image downloader** using **Telethon / MTProto**.
 
-## Important security step
+The bot can:
 
-If you pasted your token anywhere public or into ChatGPT, go to `@BotFather` and revoke/regenerate only the **PhotoStiller_bot** token.
+- Download direct image URLs.
+- Accept Telegram channel links.
+- Scan channel history for photos only.
+- Download all channel photos.
+- Save progress in SQLite.
+- Resume incomplete downloads after restart when files still exist.
+- Create a ZIP archive and send it to the owner.
+- Send albums in batches if ZIP is too large.
+- Support `/status`, `/cancel`, `/pause`, inline buttons, and owner-only access.
 
-Do not revoke `TradePilot007_bot` if you want to keep it working.
+---
 
-## Files
+## Project files
 
 ```text
-PhotoStiller-bot/
+PhotoStiller-Telethon-v3/
 ├── bot.py
+├── channel_downloader.py
+├── config.py
+├── database.py
+├── logger_setup.py
+├── utils.py
 ├── requirements.txt
 ├── Procfile
 ├── render.yaml
 ├── runtime.txt
+├── .python-version
 ├── .env.example
 ├── .gitignore
 └── README.md
 ```
 
-## Local test on your PC
+---
 
-1. Install Python 3.11+
-2. Install dependencies:
+## Important Telegram rule
 
-```bash
-pip install -r requirements.txt
+For channel history downloading, add **PhotoStiller_bot** as an **admin** in the target Telegram channel first.
+
+The bot will reject the job with:
+
+```text
+This bot must be added as an admin to this channel to read history.
 ```
 
-3. Create `.env` from `.env.example`:
+For private channels/invite links, the bot must already have access. Bots normally cannot join private invite links by themselves like a normal user.
+
+---
+
+## Environment variables for Render
+
+Add these in **Render → Environment → Add Environment Variable**:
 
 ```env
-BOT_TOKEN=your_new_photostiller_token
+API_ID=your_api_id_from_my_telegram_org
+API_HASH=your_api_hash_from_my_telegram_org
+BOT_TOKEN=your_new_photostiller_bot_token
+OWNER_ID=your_numeric_telegram_user_id
+MAX_CONCURRENT_DOWNLOADS=5
+PROGRESS_UPDATE_INTERVAL=50
+MAX_RETRIES=3
+DOWNLOAD_TIMEOUT=30
+MAX_STORAGE_GB=10
 MAX_IMAGE_MB=10
 MAX_URLS_PER_MESSAGE=5
+REQUEST_TIMEOUT=25
+TELEGRAM_ZIP_LIMIT_MB=2000
 ```
 
-4. Run:
+Do **not** add webhook variables. This bot uses polling through Telethon.
 
-```bash
-python bot.py
+---
+
+## Where to get API_ID and API_HASH
+
+1. Open `https://my.telegram.org/apps`
+2. Log in with your Telegram account.
+3. Create an app.
+4. Copy:
+   - `api_id`
+   - `api_hash`
+
+---
+
+## Where to get OWNER_ID
+
+Open Telegram and message:
+
+```text
+@userinfobot
 ```
 
-Open Telegram and send `/start` to `@PhotoStiller_bot`.
+Copy your numeric Telegram ID and put it as:
 
-## Deploy on Render without webhook
+```env
+OWNER_ID=123456789
+```
 
-This uses polling, but it also starts a tiny Flask web server for health checks. That web server is **not** a Telegram webhook.
+Only this user can use the bot.
 
-Render settings:
+---
+
+## Render settings
+
+Use:
 
 ```text
 Build Command:
 pip install -r requirements.txt
+```
 
+```text
 Start Command:
 python bot.py
 ```
 
-Environment variables on Render:
+The bot starts a small Flask health page on `/health`, so Render can see that the service is alive.
 
-```env
-BOT_TOKEN=your_new_photostiller_token
-MAX_IMAGE_MB=10
-MAX_URLS_PER_MESSAGE=5
-```
-
-After deploy, Render gives you a URL like:
-
-```text
-https://photostiller-bot.onrender.com
-```
-
-Open:
-
-```text
-https://photostiller-bot.onrender.com/health
-```
-
-If it shows `ok: true`, the web service is running.
-
-## Very important about free hosting
-
-Polling needs the program to stay alive. Free hosts may sleep when they do not receive web traffic. If the app sleeps, Telegram messages will not wake it because this bot does not use webhook.
-
-For Render Free, use a free uptime monitor to ping this URL every 5 minutes:
-
-```text
-https://your-render-app-name.onrender.com/health
-```
-
-Examples of uptime monitors:
-
-- UptimeRobot
-- Better Stack free monitor
-- cron-job.org
-
-## Best truly free 24/7 polling option
-
-A free VPS is better for polling. Oracle Cloud Always Free can run a small Linux server, but setup is harder than Render.
+---
 
 ## Commands
 
-- `/start` - intro message
-- `/help` - usage help
+```text
+/start
+```
+Welcome message.
 
-## Notes
+```text
+/help
+```
+Show usage instructions.
 
-- Send direct image links, for example `.jpg`, `.png`, `.webp`, `.gif`.
-- The bot blocks private/localhost URLs for safety.
-- Do not upload `.env` to GitHub.
+```text
+/download https://t.me/SomeChannel
+```
+Validate channel and show a Start Download button.
+
+```text
+/status
+```
+Show current progress.
+
+```text
+/cancel
+```
+Cancel current download.
+
+```text
+/pause
+```
+Pause or resume current download.
+
+---
+
+## Link formats accepted
+
+```text
+https://t.me/SomeChannel
+t.me/SomeChannel
+@SomeChannel
+https://t.me/joinchat/XXXX
+https://t.me/+XXXX
+```
+
+Private invite links only work if the bot already has access.
+
+---
+
+## Direct image URL downloader
+
+You can still send direct image links like:
+
+```text
+https://example.com/image.jpg
+```
+
+The bot downloads and sends the image back.
+
+For webpage links, the bot tries to find `og:image` preview images, but some websites block server requests.
+
+---
+
+## Safety
+
+Never upload your `.env` file to GitHub.
+
+If you pasted your token anywhere public, revoke only **PhotoStiller_bot** token in **@BotFather**, then add the new token to Render.
+
+---
+
+## Notes for free hosting
+
+Render Free can sleep. This project includes a `/health` page, but polling bots work best on always-on hosting. If Render sleeps, use an uptime monitor to ping:
+
+```text
+https://your-render-app.onrender.com/health
+```
+

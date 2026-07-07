@@ -6,9 +6,5 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: MAX_IMAGE_MB
-        value: "10"
-      - key: MAX_URLS_PER_MESSAGE
-        value: "5"
+      - key: PYTHON_VERSION
+        value: 3.11.9
