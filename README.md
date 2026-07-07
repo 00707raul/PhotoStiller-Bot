@@ -1,112 +1,117 @@
-# PhotoStiller Telegram Bot
+# PhotoStiller Telegram Bot - Polling Version
 
-A free-hostable Telegram bot that accepts a direct image URL, downloads the image, and sends it back in Telegram.
+This bot uses Telegram **polling**, not webhook.
 
-## Important security note
+It accepts direct image URL links, downloads the image, and sends it back in Telegram.
 
-Do **not** put your real Telegram token in GitHub.
+## Important security step
 
-Use environment variables on Render/Koyeb instead.
+If you pasted your token anywhere public or into ChatGPT, go to `@BotFather` and revoke/regenerate only the **PhotoStiller_bot** token.
 
-If you already pasted your token anywhere public, open **@BotFather**, choose **PhotoStiller**, and regenerate/revoke only the PhotoStiller token.
+Do not revoke `TradePilot007_bot` if you want to keep it working.
 
 ## Files
 
 ```text
 PhotoStiller-bot/
-├── app.py
+├── bot.py
 ├── requirements.txt
 ├── Procfile
 ├── render.yaml
-├── setup_webhook.py
+├── runtime.txt
 ├── .env.example
 ├── .gitignore
 └── README.md
 ```
 
-## Deploy on Render Free Web Service
+## Local test on your PC
 
-1. Create a new GitHub repo, for example `PhotoStiller-bot`.
-2. Upload all files from this project.
-3. Go to Render.
-4. Create a **New Web Service** from the GitHub repo.
-5. Use these settings:
+1. Install Python 3.11+
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Create `.env` from `.env.example`:
+
+```env
+BOT_TOKEN=your_new_photostiller_token
+MAX_IMAGE_MB=10
+MAX_URLS_PER_MESSAGE=5
+```
+
+4. Run:
+
+```bash
+python bot.py
+```
+
+Open Telegram and send `/start` to `@PhotoStiller_bot`.
+
+## Deploy on Render without webhook
+
+This uses polling, but it also starts a tiny Flask web server for health checks. That web server is **not** a Telegram webhook.
+
+Render settings:
 
 ```text
 Build Command:
 pip install -r requirements.txt
 
 Start Command:
-gunicorn app:app
+python bot.py
 ```
 
-6. Add environment variables:
+Environment variables on Render:
 
 ```env
-BOT_TOKEN=your_new_photostiller_token_here
-WEBHOOK_SECRET=make_a_long_random_secret_here
+BOT_TOKEN=your_new_photostiller_token
 MAX_IMAGE_MB=10
+MAX_URLS_PER_MESSAGE=5
 ```
 
-7. Deploy.
-
-## Set the Telegram webhook
-
-After Render gives you a URL like:
+After deploy, Render gives you a URL like:
 
 ```text
 https://photostiller-bot.onrender.com
 ```
 
-Run this command locally from the project folder:
-
-### Windows PowerShell
-
-```powershell
-$env:BOT_TOKEN="your_new_photostiller_token_here"
-$env:BASE_URL="https://your-render-app-name.onrender.com"
-$env:WEBHOOK_SECRET="same_secret_you_added_on_render"
-python setup_webhook.py
-```
-
-### macOS/Linux terminal
-
-```bash
-export BOT_TOKEN="your_new_photostiller_token_here"
-export BASE_URL="https://your-render-app-name.onrender.com"
-export WEBHOOK_SECRET="same_secret_you_added_on_render"
-python setup_webhook.py
-```
-
-If it works, Telegram will return something like:
-
-```json
-{"ok":true,"result":true,"description":"Webhook was set"}
-```
-
-## Test the bot
-
-Open `@PhotoStiller_bot` in Telegram and send:
+Open:
 
 ```text
-/start
+https://photostiller-bot.onrender.com/health
 ```
 
-Then send a direct image URL:
+If it shows `ok: true`, the web service is running.
+
+## Very important about free hosting
+
+Polling needs the program to stay alive. Free hosts may sleep when they do not receive web traffic. If the app sleeps, Telegram messages will not wake it because this bot does not use webhook.
+
+For Render Free, use a free uptime monitor to ping this URL every 5 minutes:
 
 ```text
-https://example.com/photo.jpg
+https://your-render-app-name.onrender.com/health
 ```
 
-Supported image types:
+Examples of uptime monitors:
 
-- JPG
-- PNG
-- WEBP
-- GIF
+- UptimeRobot
+- Better Stack free monitor
+- cron-job.org
+
+## Best truly free 24/7 polling option
+
+A free VPS is better for polling. Oracle Cloud Always Free can run a small Linux server, but setup is harder than Render.
+
+## Commands
+
+- `/start` - intro message
+- `/help` - usage help
 
 ## Notes
 
-This bot uses webhook mode, which is better for free hosting than polling because the server does not need to constantly ask Telegram for updates.
-
-The bot blocks localhost/private/internal network URLs for safety.
+- Send direct image links, for example `.jpg`, `.png`, `.webp`, `.gif`.
+- The bot blocks private/localhost URLs for safety.
+- Do not upload `.env` to GitHub.
