@@ -45,7 +45,7 @@ def run_health_server() -> None:
 def extract_urls(text: str) -> list[str]:
     urls = URL_RE.findall(text or "")
     # Remove common trailing punctuation copied from messages
-    cleaned = [u.rstrip(".,;!?)"] for u in urls]
+    cleaned = [u.rstrip(".,;!?)") for u in urls]
     # Keep order but remove duplicates
     return list(dict.fromkeys(cleaned))[:MAX_URLS_PER_MESSAGE]
 
