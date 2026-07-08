@@ -107,7 +107,7 @@ ALBUM_BATCH_SIZE = 10
 
 # Web dashboard configuration
 DASHBOARD_ENABLED = _bool_env("DASHBOARD_ENABLED", True)
-DASHBOARD_PUBLIC = _bool_env("DASHBOARD_PUBLIC", False)
+DASHBOARD_PUBLIC = _bool_env("DASHBOARD_PUBLIC", True)
 DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET", "").strip().strip('"').strip("'")
 DASHBOARD_REFRESH_SECONDS = max(5, _int_env("DASHBOARD_REFRESH_SECONDS", 15))
 WEB_BASE_URL = os.getenv("WEB_BASE_URL", "").strip().rstrip("/")

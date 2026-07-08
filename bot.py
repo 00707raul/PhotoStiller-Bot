@@ -354,7 +354,7 @@ def _dashboard_html(payload: dict) -> str:
         <div class="logo">📥</div>
         <div>
           <h1 id="title">{escape(payload['bot'])} Dashboard</h1>
-          <div class="muted">Live statistics website for your Telegram bot</div>
+          <div class="muted">Live statistics dashboard for PhotoSnatcher</div>
           <div class="statusLine">
             <span class="pill"><span class="dot"></span><span id="onlineText">Online</span></span>
             <span class="pill">Last update: <span id="lastUpdate">now</span></span>
@@ -441,8 +441,11 @@ def _dashboard_html(payload: dict) -> str:
       const daily = (data.daily_usage || []).map(d => `<tr><td>${{esc(d.day)}}</td><td>${{int(d.files)}}</td><td>${{int(d.channels)}}</td><td>${{int(d.direct)}}</td></tr>`).join('');
       document.getElementById('dailyRows').innerHTML = row(daily, 4);
 
-      const users = (data.recent_users || []).map(u => `<tr><td>${{esc(u.user_id)}}</td><td>@${{esc(u.username || '-')}}</td><td>${{esc(u.first_name || '-')}}</td><td>${{u.banned ? '<span class="bad">Yes</span>' : '<span class="ok">No</span>'}}</td><td>${{esc(u.last_seen || '-')}}</td></tr>`).join('');
-      document.getElementById('usersRows').innerHTML = row(users, 5);
+      const users = (data.recent_users || []).map(u => {{
+        const status = u.status === 'inactive' ? '<span class="bad">Left/blocked</span>' : '<span class="ok">Active</span>';
+        return `<tr><td>${{esc(u.user_id)}}</td><td>@${{esc(u.username || '-')}}</td><td>${{esc(u.first_name || '-')}}</td><td>${{status}}</td><td>${{u.banned ? '<span class="bad">Yes</span>' : '<span class="ok">No</span>'}}</td><td>${{esc(u.last_seen || '-')}}</td></tr>`;
+      }}).join('');
+      document.getElementById('usersRows').innerHTML = row(users, 6);
 
       const events = (data.recent_events || []).map(e => `<tr><td>${{esc(e.user_id)}}</td><td>${{esc(e.type)}}</td><td>${{esc(e.detail)}}</td><td>${{esc(e.created_at)}}</td></tr>`).join('');
       document.getElementById('eventsRows').innerHTML = row(events, 4);
