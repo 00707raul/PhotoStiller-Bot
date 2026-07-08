@@ -74,6 +74,11 @@ class DownloadJob:
     last_message_id: Optional[int] = None
     progress_message = None
     progress_message_ids: list[int] = field(default_factory=list)
+    zip_size_bytes: int = 0
+    upload_current_bytes: int = 0
+    upload_total_bytes: int = 0
+    upload_started_at: float = 0.0
+    final_step_started_at: float = 0.0
 
     def __post_init__(self):
         self.pause_event.set()
@@ -210,28 +215,92 @@ class ChannelImageDownloader:
             return "Download paused. Use /pause again to resume."
         return f"Cannot pause/resume while status is {job.status}."
 
-    def _percent(self, job: DownloadJob) -> float:
+    def _download_percent(self, job: DownloadJob) -> float:
         if job.total_photos <= 0:
             return 0.0
         return min(100.0, (job.processed_count / job.total_photos) * 100.0)
+
+    def _overall_percent(self, job: DownloadJob) -> float:
+        """User-facing progress.
+
+        Important: downloading every photo is not the whole job. After 100% photo
+        download, the bot still needs to create a ZIP and upload that ZIP to
+        Telegram. This weighted percentage keeps the main bar below 100% until
+        the Telegram delivery phase is actually complete.
+        """
+        if job.status == "finished":
+            return 100.0
+        if job.status in {"failed", "cancelled"}:
+            return max(0.0, min(100.0, self._download_percent(job)))
+        if job.status == "validating":
+            return 1.0
+        if job.status == "scanning":
+            # Scanning message history is part of the job, but Telegram does not
+            # tell us the total message count upfront, so show a small moving
+            # progress value instead of claiming completion.
+            return min(9.0, 2.0 + (job.total_seen / 500.0))
+        if job.status in {"running", "paused"}:
+            return min(85.0, 10.0 + (self._download_percent(job) * 0.75))
+        if job.status == "zipping":
+            if not job.final_step_started_at:
+                return 88.0
+            return min(93.0, 88.0 + ((time.time() - job.final_step_started_at) / 8.0))
+        if job.status == "delivering":
+            if job.upload_total_bytes:
+                upload_fraction = max(0.0, min(1.0, job.upload_current_bytes / job.upload_total_bytes))
+                return min(99.8, 94.0 + (upload_fraction * 5.8))
+            if job.final_step_started_at:
+                return min(98.0, 94.0 + ((time.time() - job.final_step_started_at) / 15.0))
+            return 94.0
+        return 0.0
 
     def _bar(self, percent: float) -> str:
         filled = int((percent / 100.0) * BAR_LENGTH)
         filled = max(0, min(BAR_LENGTH, filled))
         return "█" * filled + "░" * (BAR_LENGTH - filled)
 
+    def _upload_eta(self, job: DownloadJob) -> str:
+        if not job.upload_total_bytes or not job.upload_current_bytes or not job.upload_started_at:
+            return "calculating..."
+        elapsed = max(time.time() - job.upload_started_at, 1)
+        speed = job.upload_current_bytes / elapsed
+        remaining = max(job.upload_total_bytes - job.upload_current_bytes, 0)
+        if speed <= 0:
+            return "calculating..."
+        seconds = int(remaining / speed)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, seconds = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes}m"
+
     def _progress_text(self, job: DownloadJob) -> str:
         elapsed = max(time.time() - job.started_at, 1)
         speed = job.downloaded_count / elapsed if job.downloaded_count else 0
-        percent = self._percent(job)
+        overall_percent = self._overall_percent(job)
+        photo_percent = self._download_percent(job)
 
         if job.total_photos > 0:
             remaining = max(job.total_photos - job.processed_count, 0)
-            eta = format_eta(job.processed_count, job.started_at, remaining)
-            progress_line = f"{job.processed_count}/{job.total_photos} photos processed"
+            download_eta = format_eta(job.processed_count, job.started_at, remaining)
+            progress_line = f"Photos: {job.processed_count}/{job.total_photos} processed ({photo_percent:.1f}%)"
         else:
-            eta = "calculating..."
-            progress_line = f"{job.total_seen} messages scanned"
+            download_eta = "calculating..."
+            progress_line = f"Messages scanned: {job.total_seen}"
+
+        upload_line = ""
+        if job.status == "zipping":
+            upload_line = "\n📦 Final step: creating ZIP archive. Overall progress will reach 100% only after the ZIP is delivered."
+        elif job.status == "delivering":
+            if job.upload_total_bytes:
+                upload_line = (
+                    f"\n📤 Telegram upload: {format_bytes(job.upload_current_bytes)} / {format_bytes(job.upload_total_bytes)}"
+                    f"\n⏳ Upload ETA: {self._upload_eta(job)}"
+                )
+            else:
+                upload_line = "\n📤 Final step: sending ZIP to Telegram. Please wait until the file appears."
 
         cap_line = "\n⚠️ Public limit reached; only allowed amount will be downloaded." if job.limited_by_cap else ""
         return (
@@ -239,15 +308,17 @@ class ChannelImageDownloader:
             f"Channel: `{job.channel_key or job.channel_input}`\n"
             f"Status: **{job.status}**\n"
             f"Phase: **{job.phase}**\n\n"
-            f"`{self._bar(percent)}` **{percent:.1f}%**\n"
-            f"{progress_line}\n\n"
+            f"**Overall progress**\n"
+            f"`{self._bar(overall_percent)}` **{overall_percent:.1f}%**\n"
+            f"{progress_line}\n"
+            f"{upload_line}\n\n"
             f"✅ Downloaded: {job.downloaded_count}\n"
             f"↩️ Skipped/resumed: {job.skipped_count}\n"
             f"🔒 Locked/paid posts seen: {job.locked_paid_count}\n"
             f"⚠️ Failed: {job.failed_count}\n"
             f"🔎 Messages scanned: {job.total_seen}\n"
-            f"⚡ Speed: {speed:.2f} images/sec\n"
-            f"⏳ ETA: {eta}"
+            f"⚡ Download speed: {speed:.2f} images/sec\n"
+            f"⏳ Download ETA: {download_eta}"
             f"{cap_line}"
         )
 
@@ -473,14 +544,20 @@ class ChannelImageDownloader:
 
             job.status = "zipping"
             job.phase = "Creating ZIP archive"
+            job.final_step_started_at = time.time()
             self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
             self._write_manifest(job)
 
             zip_path = create_zip(job.folder)
             zip_size = zip_path.stat().st_size if zip_path.exists() else 0
+            job.zip_size_bytes = zip_size
 
             job.status = "delivering"
             job.phase = "Sending ZIP to Telegram"
+            job.final_step_started_at = time.time()
+            job.upload_started_at = time.time()
+            job.upload_current_bytes = 0
+            job.upload_total_bytes = zip_size
             self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
 
             summary = (
@@ -494,11 +571,16 @@ class ChannelImageDownloader:
                 summary += "\n⚠️ Public max-photo limit was reached."
 
             if zip_size <= TELEGRAM_ZIP_LIMIT_BYTES:
+                def _zip_upload_progress(current: int, total: int) -> None:
+                    job.upload_current_bytes = int(current or 0)
+                    job.upload_total_bytes = int(total or zip_size or 0)
+
                 await self.bot_client.send_file(
                     user_id,
                     str(zip_path),
                     caption=summary,
                     force_document=True,
+                    progress_callback=_zip_upload_progress,
                 )
             else:
                 job.phase = "ZIP too large, sending albums"
