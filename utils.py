@@ -6,7 +6,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Iterable, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,7 +19,8 @@ from config import (
     REQUEST_TIMEOUT,
 )
 
-URL_RE = re.compile(r"https?://[^\s<>\"]+|t\.me/[^\s<>\"]+|@[A-Za-z0-9_]{4,}", re.IGNORECASE)
+# URL regex accepts Telegram usernames, t.me links, and most normal URLs.
+URL_RE = re.compile(r"https?://[^\s<>'\"]+|t\.me/[^\s<>'\"]+|@[A-Za-z0-9_]{4,}", re.IGNORECASE)
 
 
 def ensure_dirs() -> None:
@@ -35,27 +36,28 @@ def safe_name(value: str, fallback: str = "channel") -> str:
     return value[:80]
 
 
+def clean_url(value: str) -> str:
+    url = (value or "").strip()
+    # Remove common punctuation pasted after links, but keep balanced parentheses used in real image URLs.
+    while url and url[-1] in ".,;!?":
+        url = url[:-1]
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1]
+    return url.strip()
+
+
 def extract_urls(text: str) -> List[str]:
     raw = URL_RE.findall(text or "")
-    cleaned = []
-    for url in raw:
-        url = url.strip().rstrip(".,;!?\n\r\t")
-        cleaned.append(url)
-    return cleaned
-
+    return [clean_url(url) for url in raw if clean_url(url)]
 
 
 def is_web_telegram_url(value: str) -> bool:
-    """web.telegram.org links are browser-internal links, not real Telegram channel links.
-
-    Example: https://web.telegram.org/k/#-2918294579 cannot be resolved by Telethon.
-    Users must send a real t.me link or @username.
-    """
     try:
         parsed = urlparse(value if "://" in value else "https://" + value)
         return parsed.netloc.lower() == "web.telegram.org"
     except Exception:
         return False
+
 
 def is_telegram_channel_link(value: str) -> bool:
     value = (value or "").strip()
@@ -68,8 +70,7 @@ def is_telegram_channel_link(value: str) -> bool:
 
 
 def normalize_channel_input(value: str) -> str:
-    value = (value or "").strip()
-    value = value.rstrip(".,;!?)\n\r\t")
+    value = clean_url(value)
 
     if value.startswith("@"):
         return value
@@ -81,8 +82,7 @@ def normalize_channel_input(value: str) -> str:
 
 
 def extract_invite_hash(value: str) -> Optional[str]:
-    """Return invite hash for t.me/+HASH or t.me/joinchat/HASH links."""
-    value = (value or "").strip().rstrip(".,;!?)\n\r\t")
+    value = clean_url(value)
     if not value:
         return None
 
@@ -112,11 +112,9 @@ def extract_invite_hash(value: str) -> Optional[str]:
     return None
 
 
-def _folder_size_bytes(path: Path) -> int:
-    """Return only the size of the bot download folder, not the whole server disk."""
+def folder_size_bytes(path: Path) -> int:
     if not path.exists():
         return 0
-
     total = 0
     for file_path in path.rglob("*"):
         try:
@@ -127,19 +125,30 @@ def _folder_size_bytes(path: Path) -> int:
     return total
 
 
-def has_enough_disk_space() -> bool:
-    """Check Render disk safely.
+def format_bytes(num: float) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(num) < 1024.0:
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} PB"
 
-    The old version compared MAX_STORAGE_GB with the whole Linux filesystem usage.
-    On Render that includes system files, so it could fail even when the bot folder was empty.
-    This version checks:
-    1) at least 0.5 GB real free disk remains;
-    2) only ./downloads is below MAX_STORAGE_GB.
-    """
+
+def disk_report() -> str:
+    DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(DOWNLOAD_ROOT)
+    downloads_size = folder_size_bytes(DOWNLOAD_ROOT)
+    return (
+        f"Free disk: {format_bytes(usage.free)}\n"
+        f"Downloads folder: {format_bytes(downloads_size)}\n"
+        f"Downloads limit: {MAX_STORAGE_GB:g} GB"
+    )
+
+
+def has_enough_disk_space() -> bool:
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     usage = shutil.disk_usage(DOWNLOAD_ROOT)
     free_gb = usage.free / (1024 ** 3)
-    downloads_gb = _folder_size_bytes(DOWNLOAD_ROOT) / (1024 ** 3)
+    downloads_gb = folder_size_bytes(DOWNLOAD_ROOT) / (1024 ** 3)
     return free_gb >= 0.5 and downloads_gb < MAX_STORAGE_GB
 
 
@@ -163,6 +172,8 @@ def create_zip(folder: Path) -> Path:
 def cleanup_paths(paths: Iterable[Path]) -> None:
     for path in paths:
         try:
+            if not path:
+                continue
             if path.is_dir():
                 shutil.rmtree(path, ignore_errors=True)
             elif path.exists():
@@ -204,13 +215,17 @@ def _download_direct_image_sync(url: str, output_folder: Path) -> Path:
                 url,
                 stream=True,
                 timeout=REQUEST_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0 PhotoStillerBot/1.0"},
+                headers={"User-Agent": "Mozilla/5.0 PhotoSnatcherBot/2.0"},
             )
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
 
             if not content_type.startswith("image/"):
                 raise ValueError("This link is not a direct image link.")
+
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_IMAGE_MB * 1024 * 1024:
+                raise ValueError(f"Image is too large. Max size is {MAX_IMAGE_MB} MB.")
 
             extension = content_type.split("/")[-1] or "jpg"
             if extension == "jpeg":
@@ -243,17 +258,18 @@ def _extract_og_image_sync(url: str) -> Optional[str]:
         response = requests.get(
             url,
             timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 PhotoStillerBot/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 PhotoSnatcherBot/2.0"},
         )
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         for selector in [
-            ('meta', {'property': 'og:image'}),
-            ('meta', {'name': 'twitter:image'}),
+            ("meta", {"property": "og:image"}),
+            ("meta", {"name": "twitter:image"}),
+            ("meta", {"property": "og:image:secure_url"}),
         ]:
             tag = soup.find(*selector)
             if tag and tag.get("content"):
-                return tag["content"]
+                return urljoin(url, tag["content"])
     except Exception:
         return None
     return None

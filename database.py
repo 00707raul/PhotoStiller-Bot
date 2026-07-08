@@ -1,9 +1,18 @@
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from config import DATABASE_PATH
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 class DownloadDB:
@@ -41,7 +50,53 @@ class DownloadDB:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    is_banned INTEGER DEFAULT 0,
+                    first_seen TEXT,
+                    last_seen TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_daily (
+                    user_id INTEGER NOT NULL,
+                    day TEXT NOT NULL,
+                    direct_count INTEGER DEFAULT 0,
+                    channel_count INTEGER DEFAULT 0,
+                    images_downloaded INTEGER DEFAULT 0,
+                    PRIMARY KEY(user_id, day)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    event_type TEXT,
+                    detail TEXT,
+                    created_at TEXT
+                )
+                """
+            )
 
+    # Download tracking
     def get_file_path(self, channel_key: str, message_id: int) -> Optional[str]:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -94,3 +149,122 @@ class DownloadDB:
     def clear_job(self, user_id: int) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM jobs WHERE user_id = ?", (user_id,))
+
+    # Users / moderation
+    def touch_user(self, user_id: int, username: str = "", first_name: str = "", last_name: str = "") -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users(user_id, username, first_name, last_name, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    last_seen = excluded.last_seen
+                """,
+                (user_id, username or "", first_name or "", last_name or "", now, now),
+            )
+
+    def is_banned(self, user_id: int) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            return bool(row and row[0])
+
+    def set_banned(self, user_id: int, banned: bool) -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users(user_id, is_banned, first_seen, last_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET is_banned = excluded.is_banned, last_seen = excluded.last_seen
+                """,
+                (user_id, 1 if banned else 0, now, now),
+            )
+
+    def list_users(self, limit: int = 20):
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT user_id, username, first_name, is_banned, first_seen, last_seen
+                FROM users ORDER BY last_seen DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    def list_banned(self, limit: int = 50):
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                "SELECT user_id, username, first_name, last_seen FROM users WHERE is_banned = 1 ORDER BY last_seen DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    def user_count(self) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    # Usage / quotas
+    def add_usage(self, user_id: int, direct: int = 0, channel: int = 0, images: int = 0) -> None:
+        day = _today()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_daily(user_id, day, direct_count, channel_count, images_downloaded)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, day) DO UPDATE SET
+                    direct_count = direct_count + excluded.direct_count,
+                    channel_count = channel_count + excluded.channel_count,
+                    images_downloaded = images_downloaded + excluded.images_downloaded
+                """,
+                (user_id, day, direct, channel, images),
+            )
+
+    def get_usage_today(self, user_id: int):
+        day = _today()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT direct_count, channel_count, images_downloaded FROM usage_daily WHERE user_id = ? AND day = ?",
+                (user_id, day),
+            ).fetchone()
+            return row or (0, 0, 0)
+
+    def usage_totals_today(self):
+        day = _today()
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                "SELECT COALESCE(SUM(direct_count),0), COALESCE(SUM(channel_count),0), COALESCE(SUM(images_downloaded),0) FROM usage_daily WHERE day = ?",
+                (day,),
+            ).fetchone()
+
+    # Runtime settings
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, _now_iso()),
+            )
+
+    def log_event(self, user_id: int, event_type: str, detail: str = "") -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO events(user_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, event_type, detail[:1000], _now_iso()),
+            )
+
+    def recent_events(self, limit: int = 20):
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                "SELECT user_id, event_type, detail, created_at FROM events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()

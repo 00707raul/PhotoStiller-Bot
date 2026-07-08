@@ -1,4 +1,4 @@
-"""Generate STRING_SESSION for PhotoStiller.
+"""Generate STRING_SESSION for PhotoSnatcher.
 
 Run this on your computer, not on Render:
     python generate_session.py
@@ -17,14 +17,18 @@ from telethon.sessions import StringSession
 load_dotenv()
 
 
+def _clean(value: str) -> str:
+    return (value or "").strip().strip('"').strip("'")
+
+
 def _read_api_id() -> int:
-    raw = os.getenv("API_ID") or input("API_ID: ").strip()
+    raw = _clean(os.getenv("API_ID")) or input("API_ID: ").strip()
     return int(raw)
 
 
 async def main():
     api_id = _read_api_id()
-    api_hash = os.getenv("API_HASH") or input("API_HASH: ").strip()
+    api_hash = _clean(os.getenv("API_HASH")) or input("API_HASH: ").strip()
 
     if not api_id or not api_hash:
         raise RuntimeError("API_ID and API_HASH are required.")
@@ -35,7 +39,7 @@ async def main():
     me = await client.get_me()
     print("\nLogged in successfully.")
     print(f"User: {getattr(me, 'first_name', '')} @{getattr(me, 'username', '')} ID={me.id}")
-    print("\nCOPY THIS WHOLE STRING_SESSION INTO RENDER ENV:\n")
+    print("\nCOPY THIS WHOLE VALUE INTO RENDER AS STRING_SESSION:\n")
     print(client.session.save())
     print("\nKeep this secret. Anyone with this session can access your Telegram account through API.")
     await client.disconnect()

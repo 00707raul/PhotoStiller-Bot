@@ -1,11 +1,11 @@
 import logging
-from config import LOG_FILE
+from config import LOG_FILE, BOT_NAME
 
 
 def setup_logging() -> logging.Logger:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    logger = logging.getLogger("PhotoStiller")
+    logger = logging.getLogger(BOT_NAME)
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
