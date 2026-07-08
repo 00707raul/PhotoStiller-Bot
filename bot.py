@@ -62,12 +62,19 @@ STARTED_AT = time.time()
 last_channel_start: dict[int, float] = {}
 pending_channel_links: dict[str, dict] = {}
 
+# Python 3.14 no longer creates a default event loop automatically.
+# Telethon checks the current loop during client creation, so we create one
+# explicitly and run the whole bot on the same loop. This keeps Render deploys
+# working even if Render selects Python 3.14.
+MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(MAIN_LOOP)
+
 # Bot client: receives commands and sends files.
-bot_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+bot_client = TelegramClient(SESSION_NAME, API_ID, API_HASH, loop=MAIN_LOOP)
 
 # Reader client: reads channel history. STRING_SESSION allows private invite links.
 uses_user_session = bool(STRING_SESSION)
-reader_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH) if uses_user_session else bot_client
+reader_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH, loop=MAIN_LOOP) if uses_user_session else bot_client
 
 downloader = ChannelImageDownloader(bot_client, reader_client, db, logger, uses_user_session=uses_user_session)
 
@@ -940,9 +947,19 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        MAIN_LOOP.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
     except RPCError as exc:
         logger.exception("Telegram RPC error: %s", exc)
         raise
+    finally:
+        try:
+            pending = asyncio.all_tasks(MAIN_LOOP)
+            for task in pending:
+                task.cancel()
+            if pending:
+                MAIN_LOOP.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        MAIN_LOOP.close()
