@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, STORE_DOWNLOAD_HISTORY, STORE_EVENT_DETAILS, ANALYTICS_RETENTION_DAYS
 
 
 def _now_iso() -> str:
@@ -24,6 +24,28 @@ class DownloadDB:
 
     def _connect(self):
         return sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def _ensure_column(self, conn, table: str, column: str, definition: str) -> None:
+        columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def prune_old_data(self, conn=None) -> None:
+        if ANALYTICS_RETENTION_DAYS <= 0:
+            return
+        close = False
+        if conn is None:
+            conn = self._connect()
+            close = True
+        try:
+            conn.execute("DELETE FROM events WHERE datetime(created_at) < datetime('now', ?)", (f"-{ANALYTICS_RETENTION_DAYS} days",))
+            conn.execute("DELETE FROM jobs WHERE status IN ('finished','failed','cancelled') OR datetime(updated_at) < datetime('now', ?)", (f"-{ANALYTICS_RETENTION_DAYS} days",))
+            if not STORE_DOWNLOAD_HISTORY:
+                conn.execute("DELETE FROM downloaded_images")
+        finally:
+            if close:
+                conn.commit()
+                conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -58,6 +80,9 @@ class DownloadDB:
                     first_name TEXT,
                     last_name TEXT,
                     is_banned INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    blocked_at TEXT,
+                    last_error TEXT,
                     first_seen TEXT,
                     last_seen TEXT
                 )
@@ -95,9 +120,17 @@ class DownloadDB:
                 )
                 """
             )
+            self._ensure_column(conn, "users", "status", "TEXT DEFAULT 'active'")
+            self._ensure_column(conn, "users", "blocked_at", "TEXT")
+            self._ensure_column(conn, "users", "last_error", "TEXT")
+            if not STORE_DOWNLOAD_HISTORY:
+                conn.execute("DELETE FROM downloaded_images")
+            self.prune_old_data(conn)
 
     # Download tracking
     def get_file_path(self, channel_key: str, message_id: int) -> Optional[str]:
+        if not STORE_DOWNLOAD_HISTORY:
+            return None
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT file_path FROM downloaded_images WHERE channel_key = ? AND message_id = ?",
@@ -110,6 +143,8 @@ class DownloadDB:
         return bool(file_path and Path(file_path).exists())
 
     def mark_downloaded(self, channel_key: str, message_id: int, file_path: str) -> None:
+        if not STORE_DOWNLOAD_HISTORY:
+            return
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -156,12 +191,14 @@ class DownloadDB:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO users(user_id, username, first_name, last_name, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO users(user_id, username, first_name, last_name, status, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, 'active', ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     username = excluded.username,
                     first_name = excluded.first_name,
                     last_name = excluded.last_name,
+                    status = 'active',
+                    last_error = NULL,
                     last_seen = excluded.last_seen
                 """,
                 (user_id, username or "", first_name or "", last_name or "", now, now),
@@ -177,8 +214,8 @@ class DownloadDB:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO users(user_id, is_banned, first_seen, last_seen)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO users(user_id, is_banned, status, first_seen, last_seen)
+                VALUES (?, ?, 'active', ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET is_banned = excluded.is_banned, last_seen = excluded.last_seen
                 """,
                 (user_id, 1 if banned else 0, now, now),
@@ -188,7 +225,7 @@ class DownloadDB:
         with self._lock, self._connect() as conn:
             return conn.execute(
                 """
-                SELECT user_id, username, first_name, is_banned, first_seen, last_seen
+                SELECT user_id, username, first_name, is_banned, first_seen, last_seen, COALESCE(status,'active'), COALESCE(last_error,'')
                 FROM users ORDER BY last_seen DESC LIMIT ?
                 """,
                 (limit,),
@@ -204,6 +241,30 @@ class DownloadDB:
     def user_count(self) -> int:
         with self._lock, self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    def active_user_count(self) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(status,'active') = 'active'").fetchone()[0]
+
+    def inactive_user_count(self) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(status,'active') != 'active'").fetchone()[0]
+
+    def mark_user_inactive(self, user_id: int, reason: str = "blocked") -> None:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users(user_id, status, blocked_at, last_error, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    status = excluded.status,
+                    blocked_at = excluded.blocked_at,
+                    last_error = excluded.last_error,
+                    last_seen = excluded.last_seen
+                """,
+                (user_id, reason[:40] or "inactive", now, reason[:240], now, now),
+            )
 
     # Usage / quotas
     def add_usage(self, user_id: int, direct: int = 0, channel: int = 0, images: int = 0) -> None:
@@ -301,6 +362,8 @@ class DownloadDB:
             )
 
     def log_event(self, user_id: int, event_type: str, detail: str = "") -> None:
+        if not STORE_EVENT_DETAILS:
+            detail = ""
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO events(user_id, event_type, detail, created_at) VALUES (?, ?, ?, ?)",

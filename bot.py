@@ -38,6 +38,9 @@ from config import (
     USER_DAILY_CHANNEL_LIMIT,
     USER_DAILY_DIRECT_LIMIT,
     WEB_BASE_URL,
+    STORE_DOWNLOAD_HISTORY,
+    STORE_EVENT_DETAILS,
+    ANALYTICS_RETENTION_DAYS,
 )
 from database import DownloadDB
 from logger_setup import setup_logging
@@ -159,6 +162,8 @@ def _dashboard_payload() -> dict:
         "public_mode": get_public_mode(),
         "reader": "user_session" if uses_user_session else "bot_session",
         "unique_users": db.user_count(),
+        "current_active_users": db.active_user_count(),
+        "inactive_users": db.inactive_user_count(),
         "active_users_24h": db.active_users_since(1),
         "active_users_7d": db.active_users_since(7),
         "last_user_seen": db.last_user_seen_iso(),
@@ -169,7 +174,7 @@ def _dashboard_payload() -> dict:
         "today_channel_jobs": int(today_channels or 0),
         "today_downloaded_files": int(today_images or 0),
         "active_jobs": len(active_jobs),
-        "max_active_jobs": MAX_ACTIVE_JOBS,
+        "max_active_jobs": "unlimited" if MAX_ACTIVE_JOBS <= 0 else MAX_ACTIVE_JOBS,
         "downloads_folder_size": format_bytes(downloads_size),
         "disk_report": disk_report(),
         "recent_users": [
@@ -180,6 +185,8 @@ def _dashboard_payload() -> dict:
                 "banned": bool(row[3]),
                 "first_seen": row[4] or "",
                 "last_seen": row[5] or "",
+                "status": row[6] if len(row) > 6 else "active",
+                "last_error": row[7] if len(row) > 7 else "",
             }
             for row in recent_users
         ],
@@ -362,7 +369,8 @@ def _dashboard_html(payload: dict) -> str:
     </div>
 
     <div class="grid">
-      <div class="card"><div class="label">Unique users</div><div class="value" id="unique_users">0</div><div class="sub" id="active_users">24h: 0 • 7d: 0</div></div>
+      <div class="card"><div class="label">Current active users</div><div class="value" id="current_active_users">0</div><div class="sub" id="active_users">24h: 0 • 7d: 0</div></div>
+      <div class="card"><div class="label">Known users</div><div class="value" id="unique_users">0</div><div class="sub" id="inactive_users">Left/blocked: 0</div></div>
       <div class="card"><div class="label">Downloaded files</div><div class="value" id="total_downloaded_files">0</div><div class="sub" id="today_downloaded_files">Today: 0</div></div>
       <div class="card"><div class="label">Channel jobs</div><div class="value" id="total_channel_jobs">0</div><div class="sub" id="today_channel_jobs">Today: 0</div></div>
       <div class="card"><div class="label">Direct URL downloads</div><div class="value" id="total_direct_urls">0</div><div class="sub" id="today_direct_urls">Today: 0</div></div>
@@ -379,7 +387,7 @@ def _dashboard_html(payload: dict) -> str:
       <div class="section"><h2>Disk</h2><pre id="diskReport">Loading...</pre></div>
     </div>
 
-    <div class="section"><h2>Recent users</h2><table><thead><tr><th>User ID</th><th>Username</th><th>Name</th><th>Banned</th><th>Last seen</th></tr></thead><tbody id="usersRows"></tbody></table></div>
+    <div class="section"><h2>Recent users</h2><table><thead><tr><th>User ID</th><th>Username</th><th>Name</th><th>Status</th><th>Banned</th><th>Last seen</th></tr></thead><tbody id="usersRows"></tbody></table></div>
     <div class="section"><h2>Recent events</h2><table><thead><tr><th>User ID</th><th>Type</th><th>Detail</th><th>Time</th></tr></thead><tbody id="eventsRows"></tbody></table></div>
     <p class="small">This page refreshes automatically every {int(refresh_ms/1000)} seconds using JavaScript.</p>
   </div>
@@ -401,7 +409,9 @@ def _dashboard_html(payload: dict) -> str:
 
     function render(data) {{
       set('title', `${{data.bot || 'PhotoSnatcher'}} Dashboard`);
+      set('current_active_users', int(data.current_active_users));
       set('unique_users', int(data.unique_users));
+      set('inactive_users', `Left/blocked: ${int(data.inactive_users)}`);
       set('active_users', `24h: ${{int(data.active_users_24h)}} • 7d: ${{int(data.active_users_7d)}}`);
       set('total_downloaded_files', int(data.total_downloaded_files));
       set('today_downloaded_files', `Today: ${{int(data.today_downloaded_files)}}`);
@@ -409,7 +419,7 @@ def _dashboard_html(payload: dict) -> str:
       set('today_channel_jobs', `Today: ${{int(data.today_channel_jobs)}}`);
       set('total_direct_urls', int(data.total_direct_urls));
       set('today_direct_urls', `Today: ${{int(data.today_direct_urls)}}`);
-      set('active_jobs', `${{int(data.active_jobs)}}/${{int(data.max_active_jobs)}}`);
+      set('active_jobs', `${{int(data.active_jobs)}}/${{data.max_active_jobs === 'unlimited' ? '∞' : int(data.max_active_jobs)}}`);
       set('active_jobs_sub', `Reader: ${{data.reader || '-'}}`);
       set('status', data.status || 'online');
       set('uptime', `Uptime: ${{data.uptime || '-'}}`);
@@ -582,10 +592,10 @@ def can_start_channel_job(user_id: int) -> tuple[bool, str]:
     if is_admin(user_id):
         return True, ""
     _, channel_count, _ = db.get_usage_today(user_id)
-    if channel_count >= USER_DAILY_CHANNEL_LIMIT:
+    if USER_DAILY_CHANNEL_LIMIT > 0 and channel_count >= USER_DAILY_CHANNEL_LIMIT:
         return False, f"Daily channel download limit reached: {channel_count}/{USER_DAILY_CHANNEL_LIMIT}. Try again tomorrow."
     last = last_channel_start.get(user_id, 0)
-    remaining = int(MIN_SECONDS_BETWEEN_JOBS - (time.time() - last))
+    remaining = int(MIN_SECONDS_BETWEEN_JOBS - (time.time() - last)) if MIN_SECONDS_BETWEEN_JOBS > 0 else 0
     if remaining > 0:
         return False, f"Please wait {remaining}s before starting another download."
     return True, ""
@@ -751,6 +761,21 @@ async def cleanup_handler(event):
     await event.reply("✅ Cleanup complete. Temporary download files were deleted.\n\n" + disk_report())
 
 
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/privacy$"))
+@access_control
+async def privacy_handler(event):
+    text = (
+        "🔐 **Storage/privacy mode**\n"
+        f"Per-photo history stored: `{STORE_DOWNLOAD_HISTORY}`\n"
+        f"Detailed event links stored: `{STORE_EVENT_DETAILS}`\n"
+        f"Analytics retention days: `{ANALYTICS_RETENTION_DAYS}`\n\n"
+        "The bot deletes temporary ZIP/image files after delivery unless KEEP_TEMP_FILES=true. "
+        "Dashboard uses aggregate counters only, not saved ZIP files."
+    )
+    await event.reply(text, parse_mode="md")
+
 @bot_client.on(events.NewMessage(pattern=r"^/admin$"))
 @admin_only
 async def admin_handler(event):
@@ -775,8 +800,9 @@ async def stats_handler(event):
         f"Uptime: {uptime_text()}\n"
         f"Public mode: {get_public_mode()}\n"
         f"Reader: {'user session' if uses_user_session else 'bot session'}\n"
-        f"Active jobs: {len(downloader.active_jobs())}/{MAX_ACTIVE_JOBS}\n"
-        f"Known users: {db.user_count()}\n"
+        f"Active jobs: {len(downloader.active_jobs())}/{'unlimited' if MAX_ACTIVE_JOBS <= 0 else MAX_ACTIVE_JOBS}\n"
+        f"Current active users: {db.active_user_count()}\n"
+        f"Known users: {db.user_count()} | Left/blocked: {db.inactive_user_count()}\n"
         f"Today direct URLs: {direct}\n"
         f"Today channel jobs: {channels}\n"
         f"Today images delivered: {images}\n\n"
@@ -801,10 +827,13 @@ async def users_handler(event):
         await event.reply("No users saved yet.")
         return
     lines = [f"Recent users ({len(rows)}):"]
-    for user_id, username, first_name, banned, first_seen, last_seen in rows:
+    for row in rows:
+        user_id, username, first_name, banned, first_seen, last_seen = row[:6]
+        status = row[6] if len(row) > 6 else "active"
         name = f"@{username}" if username else (first_name or "no name")
         ban = " 🚫" if banned else ""
-        lines.append(f"• `{user_id}` {name}{ban} | last: {last_seen}")
+        state = "✅" if status == "active" else "🚪"
+        lines.append(f"• `{user_id}` {name}{ban} {state} {status} | last: {last_seen}")
     await event.reply("\n".join(lines), parse_mode="md")
 
 
@@ -973,7 +1002,7 @@ async def callback_handler(event):
         await event.answer("OK")
         if data == "admin_stats":
             direct, channels, images = db.usage_totals_today()
-            await event.respond(f"Stats:\nUptime: {uptime_text()}\nUsers: {db.user_count()}\nToday direct: {direct}\nToday channels: {channels}\nToday images: {images}\nActive jobs: {len(downloader.active_jobs())}/{MAX_ACTIVE_JOBS}")
+            await event.respond(f"Stats:\nUptime: {uptime_text()}\nActive users: {db.active_user_count()}\nKnown users: {db.user_count()}\nLeft/blocked: {db.inactive_user_count()}\nToday direct: {direct}\nToday channels: {channels}\nToday images: {images}\nActive jobs: {len(downloader.active_jobs())}/{'unlimited' if MAX_ACTIVE_JOBS <= 0 else MAX_ACTIVE_JOBS}")
         elif data == "admin_queue":
             await event.respond(downloader.queue_text(), parse_mode="md")
         elif data == "admin_users":
@@ -1053,7 +1082,7 @@ async def text_handler(event):
         return
 
     direct_count, _, _ = db.get_usage_today(event.sender_id)
-    if not is_admin(event.sender_id) and direct_count >= USER_DAILY_DIRECT_LIMIT:
+    if USER_DAILY_DIRECT_LIMIT > 0 and not is_admin(event.sender_id) and direct_count >= USER_DAILY_DIRECT_LIMIT:
         await event.reply(f"❌ Daily direct URL limit reached: {direct_count}/{USER_DAILY_DIRECT_LIMIT}. Try again tomorrow.")
         return
 
@@ -1106,7 +1135,7 @@ async def main():
     await bot_client.start(bot_token=BOT_TOKEN)
     bot_me = await bot_client.get_me()
     logger.info("Bot started as @%s", getattr(bot_me, "username", "unknown"))
-    logger.info("PUBLIC_MODE=%s | MAX_ACTIVE_JOBS=%s | private_links_for_public=%s", get_public_mode(), MAX_ACTIVE_JOBS, ALLOW_PRIVATE_LINKS_FOR_PUBLIC)
+    logger.info("PUBLIC_MODE=%s | MAX_ACTIVE_JOBS=%s | private_links_for_public=%s | STORE_DOWNLOAD_HISTORY=%s", get_public_mode(), "unlimited" if MAX_ACTIVE_JOBS <= 0 else MAX_ACTIVE_JOBS, ALLOW_PRIVATE_LINKS_FOR_PUBLIC, STORE_DOWNLOAD_HISTORY)
 
     if uses_user_session:
         await reader_client.start()

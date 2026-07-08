@@ -57,18 +57,18 @@ if OWNER_ID:
 # Access control
 PUBLIC_MODE = _bool_env("PUBLIC_MODE", False)
 ALLOW_PRIVATE_LINKS_FOR_PUBLIC = _bool_env("ALLOW_PRIVATE_LINKS_FOR_PUBLIC", False)
-MAX_ACTIVE_JOBS = _int_env("MAX_ACTIVE_JOBS", 2)
+MAX_ACTIVE_JOBS = _int_env("MAX_ACTIVE_JOBS", 0)  # 0 = unlimited global concurrent jobs
 
 # Optional user account session, needed for private invite links like https://t.me/+XXXX.
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip().strip('"').strip("'")
 
 # Abuse protection / public limits
 # 0 = unlimited. Owner/admins are controlled by OWNER_MAX_PHOTOS_PER_JOB.
-PUBLIC_MAX_PHOTOS_PER_JOB = _int_env("PUBLIC_MAX_PHOTOS_PER_JOB", 500)
+PUBLIC_MAX_PHOTOS_PER_JOB = _int_env("PUBLIC_MAX_PHOTOS_PER_JOB", 0)
 OWNER_MAX_PHOTOS_PER_JOB = _int_env("OWNER_MAX_PHOTOS_PER_JOB", 0)
-USER_DAILY_CHANNEL_LIMIT = _int_env("USER_DAILY_CHANNEL_LIMIT", 5)
-USER_DAILY_DIRECT_LIMIT = _int_env("USER_DAILY_DIRECT_LIMIT", 50)
-MIN_SECONDS_BETWEEN_JOBS = _int_env("MIN_SECONDS_BETWEEN_JOBS", 10)
+USER_DAILY_CHANNEL_LIMIT = _int_env("USER_DAILY_CHANNEL_LIMIT", 0)
+USER_DAILY_DIRECT_LIMIT = _int_env("USER_DAILY_DIRECT_LIMIT", 0)
+MIN_SECONDS_BETWEEN_JOBS = _int_env("MIN_SECONDS_BETWEEN_JOBS", 0)
 
 # Download configuration
 MAX_CONCURRENT_DOWNLOADS = _int_env("MAX_CONCURRENT_DOWNLOADS", 5)
@@ -83,6 +83,14 @@ REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 25)
 SCAN_ALL_MESSAGES_FOR_REPORTS = _bool_env("SCAN_ALL_MESSAGES_FOR_REPORTS", True)
 KEEP_TEMP_FILES = _bool_env("KEEP_TEMP_FILES", False)
 DELETE_PROGRESS_MESSAGES = _bool_env("DELETE_PROGRESS_MESSAGES", True)
+
+# Privacy/storage control
+# False = do not store per-photo file paths/message IDs for resume. This keeps the DB small.
+STORE_DOWNLOAD_HISTORY = _bool_env("STORE_DOWNLOAD_HISTORY", False)
+# False = events store only safe summary text, not full user links/URLs.
+STORE_EVENT_DETAILS = _bool_env("STORE_EVENT_DETAILS", False)
+# Delete old analytics rows/events automatically. 0 = keep aggregate analytics forever.
+ANALYTICS_RETENTION_DAYS = _int_env("ANALYTICS_RETENTION_DAYS", 30)
 
 # Runtime folders
 BASE_DIR = Path(__file__).resolve().parent

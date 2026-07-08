@@ -105,7 +105,8 @@ class ChannelImageDownloader:
         active = self.active_jobs()
         if not active:
             return "No active downloads."
-        lines = [f"Active downloads: {len(active)}/{MAX_ACTIVE_JOBS}"]
+        limit_text = "unlimited" if MAX_ACTIVE_JOBS <= 0 else str(MAX_ACTIVE_JOBS)
+        lines = [f"Active downloads: {len(active)}/{limit_text}"]
         for job in active:
             lines.append(
                 f"• User `{job.user_id}` | `{job.channel_key or job.channel_input}` | {job.status} | {job.processed_count}/{job.total_photos or '?'}"
@@ -165,7 +166,7 @@ class ChannelImageDownloader:
         if user_id in self.jobs and self.jobs[user_id].status in ACTIVE_STATES:
             return "A download is already running. Use /status, /pause, or /cancel first."
 
-        if len(self.active_jobs()) >= MAX_ACTIVE_JOBS:
+        if MAX_ACTIVE_JOBS > 0 and len(self.active_jobs()) >= MAX_ACTIVE_JOBS:
             return f"Server is busy. Maximum active downloads reached ({MAX_ACTIVE_JOBS}). Try again later."
 
         if not has_enough_disk_space():
@@ -475,7 +476,7 @@ class ChannelImageDownloader:
                 job.status = "finished"
                 job.phase = "Finished"
                 locked_note = f"\nLocked/paid posts seen: {job.locked_paid_count}." if job.locked_paid_count else ""
-                await self.bot_client.send_message(user_id, f"No accessible images found in this channel.{locked_note}")
+                await self._safe_send_message(user_id, f"No accessible images found in this channel.{locked_note}")
                 return
 
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -539,7 +540,7 @@ class ChannelImageDownloader:
             if job.downloaded_count == 0:
                 job.status = "finished"
                 job.phase = "Finished"
-                await self.bot_client.send_message(user_id, "No new accessible images found in this channel.")
+                await self._safe_send_message(user_id, "No new accessible images found in this channel.")
                 return
 
             job.status = "zipping"
@@ -575,7 +576,7 @@ class ChannelImageDownloader:
                     job.upload_current_bytes = int(current or 0)
                     job.upload_total_bytes = int(total or zip_size or 0)
 
-                await self.bot_client.send_file(
+                await self._safe_send_file(
                     user_id,
                     str(zip_path),
                     caption=summary,
@@ -585,7 +586,7 @@ class ChannelImageDownloader:
             else:
                 job.phase = "ZIP too large, sending albums"
                 await self._send_album_batches(user_id, job.folder)
-                await self.bot_client.send_message(
+                await self._safe_send_message(
                     user_id,
                     f"✅ Done. ZIP was too large, so images were sent in batches. Total downloaded: {job.downloaded_count}.",
                 )
@@ -593,25 +594,25 @@ class ChannelImageDownloader:
             job.status = "finished"
             job.phase = "Finished"
             self.db.add_usage(user_id, images=job.downloaded_count)
-            self.db.set_job(user_id, channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.bot_client.send_message(user_id, "✅ Cleanup complete. Temporary progress message and server files were removed." if not KEEP_TEMP_FILES else "✅ Done. Temporary files were kept because KEEP_TEMP_FILES=true.")
+            self.db.clear_job(user_id)
+            await self._safe_send_message(user_id, "✅ Cleanup complete. Temporary progress message and server files were removed." if not KEEP_TEMP_FILES else "✅ Done. Temporary files were kept because KEEP_TEMP_FILES=true.")
 
         except asyncio.CancelledError:
             job.status = "cancelled"
             job.phase = "Cancelled"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.bot_client.send_message(user_id, f"Cancelled. Downloaded before cancel: {job.downloaded_count} images.")
+            await self._safe_send_message(user_id, f"Cancelled. Downloaded before cancel: {job.downloaded_count} images.")
         except PermissionError as exc:
             job.status = "failed"
             job.phase = "Failed"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.bot_client.send_message(user_id, f"❌ {exc}")
+            await self._safe_send_message(user_id, f"❌ {exc}")
         except Exception as exc:
             self.logger.exception("Download failed")
             job.status = "failed"
             job.phase = "Failed"
             self.db.set_job(user_id, job.channel_key, job.status, job.downloaded_count, job.total_seen)
-            await self.bot_client.send_message(user_id, f"❌ Download failed: {exc}")
+            await self._safe_send_message(user_id, f"❌ Download failed: {exc}")
         finally:
             if progress_task:
                 progress_task.cancel()
@@ -632,7 +633,33 @@ class ChannelImageDownloader:
                     if job.channel_key:
                         self.db.remove_channel_records(job.channel_key)
                 cleanup_paths(cleanup)
+                self.db.clear_job(user_id)
                 self.jobs.pop(user_id, None)
+
+
+    async def _safe_send_message(self, user_id: int, text: str, **kwargs) -> bool:
+        try:
+            await self.bot_client.send_message(user_id, text, **kwargs)
+            return True
+        except Exception as exc:
+            self.logger.warning("Could not send message to user %s: %s", user_id, exc)
+            try:
+                self.db.mark_user_inactive(user_id, str(exc))
+            except Exception:
+                pass
+            return False
+
+    async def _safe_send_file(self, user_id: int, file, **kwargs) -> bool:
+        try:
+            await self.bot_client.send_file(user_id, file, **kwargs)
+            return True
+        except Exception as exc:
+            self.logger.warning("Could not send file to user %s: %s", user_id, exc)
+            try:
+                self.db.mark_user_inactive(user_id, str(exc))
+            except Exception:
+                pass
+            return False
 
     async def _download_one(self, job: DownloadJob, channel_key: str, message, semaphore: asyncio.Semaphore) -> bool:
         async with semaphore:
@@ -670,8 +697,8 @@ class ChannelImageDownloader:
         for i in range(0, len(images), ALBUM_BATCH_SIZE):
             batch = images[i : i + ALBUM_BATCH_SIZE]
             try:
-                await self.bot_client.send_file(user_id, batch, album=True)
+                await self._safe_send_file(user_id, batch, album=True)
             except Exception:
                 for image in batch:
-                    await self.bot_client.send_file(user_id, image)
+                    await self._safe_send_file(user_id, image)
             await asyncio.sleep(1)
