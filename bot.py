@@ -411,7 +411,7 @@ def _dashboard_html(payload: dict) -> str:
       set('title', `${{data.bot || 'PhotoSnatcher'}} Dashboard`);
       set('current_active_users', int(data.current_active_users));
       set('unique_users', int(data.unique_users));
-      set('inactive_users', `Left/blocked: ${int(data.inactive_users)}`);
+      set('inactive_users', `Left/blocked: ${{int(data.inactive_users)}}`);
       set('active_users', `24h: ${{int(data.active_users_24h)}} • 7d: ${{int(data.active_users_7d)}}`);
       set('total_downloaded_files', int(data.total_downloaded_files));
       set('today_downloaded_files', `Today: ${{int(data.today_downloaded_files)}}`);
