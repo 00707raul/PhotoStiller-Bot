@@ -230,6 +230,51 @@ class DownloadDB:
             ).fetchone()
             return row or (0, 0, 0)
 
+
+    def usage_totals_all_time(self):
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(direct_count),0),
+                    COALESCE(SUM(channel_count),0),
+                    COALESCE(SUM(images_downloaded),0)
+                FROM usage_daily
+                """
+            ).fetchone()
+
+    def active_users_since(self, days: int = 7) -> int:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT COUNT(*) FROM users
+                WHERE datetime(last_seen) >= datetime('now', ?)
+                """,
+                (f"-{int(days)} days",),
+            ).fetchone()[0]
+
+    def daily_usage_last_days(self, days: int = 14):
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT day,
+                       COALESCE(SUM(direct_count),0) AS direct_total,
+                       COALESCE(SUM(channel_count),0) AS channel_total,
+                       COALESCE(SUM(images_downloaded),0) AS image_total
+                FROM usage_daily
+                WHERE date(day) >= date('now', ?)
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT ?
+                """,
+                (f"-{int(days)} days", int(days)),
+            ).fetchall()
+
+    def last_user_seen_iso(self) -> str:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT MAX(last_seen) FROM users").fetchone()
+            return row[0] or "never"
+
     def usage_totals_today(self):
         day = _today()
         with self._lock, self._connect() as conn:

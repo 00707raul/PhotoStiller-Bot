@@ -2,9 +2,10 @@ import asyncio
 import secrets
 import threading
 import time
+from html import escape
 from pathlib import Path
 
-from flask import Flask
+from flask import Flask, Response, jsonify, request
 from telethon import Button, TelegramClient, events
 from telethon.errors import RPCError
 from telethon.sessions import StringSession
@@ -18,6 +19,10 @@ from config import (
     BOT_NAME,
     BOT_TOKEN,
     DATA_DIR,
+    DASHBOARD_ENABLED,
+    DASHBOARD_PUBLIC,
+    DASHBOARD_REFRESH_SECONDS,
+    DASHBOARD_SECRET,
     DOWNLOAD_ROOT,
     LOG_FILE,
     MAX_ACTIVE_JOBS,
@@ -32,6 +37,7 @@ from config import (
     STRING_SESSION,
     USER_DAILY_CHANNEL_LIMIT,
     USER_DAILY_DIRECT_LIMIT,
+    WEB_BASE_URL,
 )
 from database import DownloadDB
 from logger_setup import setup_logging
@@ -82,6 +88,191 @@ def health():
         "public_mode": get_public_mode(),
         "active_jobs": len(downloader.active_jobs()),
     }
+
+
+@health_app.route("/api/stats")
+def api_stats():
+    if not _dashboard_allowed():
+        return jsonify({"ok": False, "error": "dashboard locked"}), 401
+    return jsonify(_dashboard_payload())
+
+
+@health_app.route("/dashboard")
+def dashboard():
+    if not DASHBOARD_ENABLED:
+        return Response("Dashboard disabled", status=404)
+    if not _dashboard_allowed():
+        message = "Dashboard locked. Add DASHBOARD_SECRET in Render and open /dashboard?key=YOUR_SECRET, or set DASHBOARD_PUBLIC=true."
+        return Response(message, status=401, mimetype="text/plain")
+    return Response(_dashboard_html(_dashboard_payload()), mimetype="text/html")
+
+
+def _dashboard_allowed() -> bool:
+    if not DASHBOARD_ENABLED:
+        return False
+    if DASHBOARD_PUBLIC:
+        return True
+    supplied_key = request.args.get("key", "") or request.headers.get("X-Dashboard-Key", "")
+    return bool(DASHBOARD_SECRET and secrets.compare_digest(supplied_key, DASHBOARD_SECRET))
+
+
+def _dashboard_link(include_secret: bool = True) -> str:
+    base = (WEB_BASE_URL or "").rstrip("/")
+    url = f"{base}/dashboard" if base else "/dashboard"
+    if include_secret and DASHBOARD_SECRET and not DASHBOARD_PUBLIC:
+        url += f"?key={DASHBOARD_SECRET}"
+    return url
+
+
+def _dashboard_payload() -> dict:
+    today_direct, today_channels, today_images = db.usage_totals_today()
+    total_direct, total_channels, total_images = db.usage_totals_all_time()
+    recent_users = db.list_users(8)
+    recent_events = db.recent_events(12)
+    daily_rows = db.daily_usage_last_days(14)
+    active_jobs = downloader.active_jobs()
+    downloads_size = folder_size_bytes(DOWNLOAD_ROOT)
+    return {
+        "bot": BOT_NAME,
+        "status": "online",
+        "uptime": uptime_text(),
+        "public_mode": get_public_mode(),
+        "reader": "user_session" if uses_user_session else "bot_session",
+        "unique_users": db.user_count(),
+        "active_users_24h": db.active_users_since(1),
+        "active_users_7d": db.active_users_since(7),
+        "last_user_seen": db.last_user_seen_iso(),
+        "total_direct_urls": int(total_direct or 0),
+        "total_channel_jobs": int(total_channels or 0),
+        "total_downloaded_files": int(total_images or 0),
+        "today_direct_urls": int(today_direct or 0),
+        "today_channel_jobs": int(today_channels or 0),
+        "today_downloaded_files": int(today_images or 0),
+        "active_jobs": len(active_jobs),
+        "max_active_jobs": MAX_ACTIVE_JOBS,
+        "downloads_folder_size": format_bytes(downloads_size),
+        "disk_report": disk_report(),
+        "recent_users": [
+            {
+                "user_id": row[0],
+                "username": row[1] or "",
+                "first_name": row[2] or "",
+                "banned": bool(row[3]),
+                "first_seen": row[4] or "",
+                "last_seen": row[5] or "",
+            }
+            for row in recent_users
+        ],
+        "recent_events": [
+            {"user_id": row[0], "type": row[1], "detail": row[2], "created_at": row[3]}
+            for row in recent_events
+        ],
+        "daily_usage": [
+            {"day": row[0], "direct": int(row[1] or 0), "channels": int(row[2] or 0), "files": int(row[3] or 0)}
+            for row in daily_rows
+        ],
+        "jobs": [
+            {
+                "user_id": job.user_id,
+                "channel": job.channel_key or job.channel_input,
+                "status": job.status,
+                "phase": job.phase,
+                "downloaded": job.downloaded_count,
+                "processed": job.processed_count,
+                "total": job.total_photos,
+            }
+            for job in active_jobs
+        ],
+    }
+
+
+def _card(title: str, value: str, sub: str = "") -> str:
+    return f"""
+    <div class=\"card\">
+      <div class=\"label\">{escape(title)}</div>
+      <div class=\"value\">{escape(str(value))}</div>
+      <div class=\"sub\">{escape(sub)}</div>
+    </div>
+    """
+
+
+def _dashboard_html(payload: dict) -> str:
+    users_rows = "".join(
+        f"<tr><td>{escape(str(u['user_id']))}</td><td>@{escape(u['username'] or '-')}</td><td>{escape(u['first_name'] or '-')}</td><td>{'Yes' if u['banned'] else 'No'}</td><td>{escape(u['last_seen'])}</td></tr>"
+        for u in payload["recent_users"]
+    ) or "<tr><td colspan='5'>No users yet</td></tr>"
+    events_rows = "".join(
+        f"<tr><td>{escape(str(e['user_id']))}</td><td>{escape(e['type'])}</td><td>{escape(e['detail'])}</td><td>{escape(e['created_at'])}</td></tr>"
+        for e in payload["recent_events"]
+    ) or "<tr><td colspan='4'>No events yet</td></tr>"
+    daily_rows = "".join(
+        f"<tr><td>{escape(d['day'])}</td><td>{d['files']}</td><td>{d['channels']}</td><td>{d['direct']}</td></tr>"
+        for d in payload["daily_usage"]
+    ) or "<tr><td colspan='4'>No daily usage yet</td></tr>"
+    job_rows = "".join(
+        f"<tr><td>{escape(str(j['user_id']))}</td><td>{escape(j['channel'])}</td><td>{escape(j['status'])}</td><td>{escape(j['phase'])}</td><td>{j['downloaded']}/{j['total'] or '?'}</td></tr>"
+        for j in payload["jobs"]
+    ) or "<tr><td colspan='5'>No active downloads</td></tr>"
+
+    cards = "".join([
+        _card("Unique users", payload["unique_users"], f"24h: {payload['active_users_24h']} • 7d: {payload['active_users_7d']}"),
+        _card("Downloaded files", payload["total_downloaded_files"], f"Today: {payload['today_downloaded_files']}"),
+        _card("Channel jobs", payload["total_channel_jobs"], f"Today: {payload['today_channel_jobs']}"),
+        _card("Direct URLs", payload["total_direct_urls"], f"Today: {payload['today_direct_urls']}"),
+        _card("Active jobs", f"{payload['active_jobs']}/{payload['max_active_jobs']}", payload["reader"]),
+        _card("Server", payload["status"], f"Uptime: {payload['uptime']}"),
+    ])
+
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta http-equiv=\"refresh\" content=\"{DASHBOARD_REFRESH_SECONDS}\">
+  <title>{escape(payload['bot'])} Dashboard</title>
+  <style>
+    :root {{ --bg:#07111f; --panel:#0e1b2e; --panel2:#13233a; --text:#eef6ff; --muted:#8ea4bd; --blue:#2aa7ff; --green:#37d67a; --border:#223750; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:linear-gradient(135deg,#06101d,#0a2442); color:var(--text); }}
+    .wrap {{ max-width:1180px; margin:0 auto; padding:28px 18px 60px; }}
+    .top {{ display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:22px; }}
+    h1 {{ margin:0; font-size:30px; letter-spacing:-0.5px; }}
+    .pill {{ display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border:1px solid var(--border); background:rgba(255,255,255,.04); border-radius:999px; color:var(--muted); }}
+    .dot {{ width:10px; height:10px; background:var(--green); border-radius:999px; box-shadow:0 0 12px var(--green); }}
+    .grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:18px; }}
+    .card {{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--border); border-radius:18px; padding:20px; box-shadow:0 14px 40px rgba(0,0,0,.22); }}
+    .label {{ color:var(--muted); font-size:14px; margin-bottom:10px; }}
+    .value {{ font-size:34px; font-weight:800; letter-spacing:-1px; }}
+    .sub {{ color:var(--muted); margin-top:8px; font-size:13px; min-height:18px; }}
+    .section {{ background:rgba(14,27,46,.84); border:1px solid var(--border); border-radius:18px; padding:18px; margin-top:16px; overflow:auto; }}
+    .section h2 {{ margin:0 0 14px; font-size:18px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+    th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); vertical-align:top; }}
+    th {{ color:#b6c9dd; font-weight:700; }}
+    td {{ color:#e8f2fb; }}
+    pre {{ white-space:pre-wrap; color:#c7d7e8; background:#07111f; border:1px solid var(--border); border-radius:12px; padding:12px; }}
+    a {{ color:var(--blue); }}
+    @media (max-width:800px) {{ .grid {{ grid-template-columns:1fr; }} .top {{ flex-direction:column; align-items:flex-start; }} }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <div class=\"top\">
+      <div>
+        <h1>📥 {escape(payload['bot'])} Dashboard</h1>
+        <div class=\"pill\"><span class=\"dot\"></span> Live on Render • auto refresh every {DASHBOARD_REFRESH_SECONDS}s</div>
+      </div>
+      <div class=\"pill\">Public mode: {escape(str(payload['public_mode']))}</div>
+    </div>
+    <div class=\"grid\">{cards}</div>
+    <div class=\"section\"><h2>Active downloads</h2><table><tr><th>User</th><th>Channel</th><th>Status</th><th>Phase</th><th>Files</th></tr>{job_rows}</table></div>
+    <div class=\"section\"><h2>Last 14 days</h2><table><tr><th>Day</th><th>Downloaded files</th><th>Channel jobs</th><th>Direct URLs</th></tr>{daily_rows}</table></div>
+    <div class=\"section\"><h2>Recent users</h2><table><tr><th>User ID</th><th>Username</th><th>Name</th><th>Banned</th><th>Last seen</th></tr>{users_rows}</table></div>
+    <div class=\"section\"><h2>Recent events</h2><table><tr><th>User ID</th><th>Type</th><th>Detail</th><th>Time</th></tr>{events_rows}</table></div>
+    <div class=\"section\"><h2>Disk</h2><pre>{escape(payload['disk_report'])}</pre></div>
+  </div>
+</body>
+</html>"""
 
 
 def run_health_server():
@@ -268,6 +459,7 @@ Useful commands:
 Admin commands:
 /admin - control panel
 /stats - bot statistics
+/dashboard - private Render stats website link
 /queue - active downloads
 /users - recent users
 /ban <id> - block user
@@ -319,6 +511,18 @@ async def ping_handler(event):
     await event.reply(f"✅ Pong. Uptime: {uptime_text()}")
 
 
+
+@bot_client.on(events.NewMessage(pattern=r"^/dashboard$"))
+@admin_only
+async def dashboard_link_handler(event):
+    if not DASHBOARD_ENABLED:
+        await event.reply("❌ Dashboard is disabled. Set DASHBOARD_ENABLED=true in Render env.")
+        return
+    if not DASHBOARD_PUBLIC and not DASHBOARD_SECRET:
+        await event.reply("⚠️ Dashboard needs DASHBOARD_SECRET in Render env. Add it, redeploy, then use /dashboard again.")
+        return
+    await event.reply(f"📊 Web dashboard:\n{_dashboard_link(include_secret=True)}")
+
 @bot_client.on(events.NewMessage(pattern=r"^/sessionstatus$"))
 @admin_only
 async def session_status_handler(event):
@@ -369,9 +573,10 @@ async def admin_handler(event):
     await event.reply(
         f"🛠 **{BOT_NAME} Admin Panel**\nChoose an action:",
         buttons=[
-            [Button.inline("📊 Stats", data=b"admin_stats"), Button.inline("📥 Queue", data=b"admin_queue")],
-            [Button.inline("👥 Users", data=b"admin_users"), Button.inline("💾 Disk", data=b"admin_disk")],
-            [Button.inline("🌍 Public mode", data=b"admin_public"), Button.inline("🧹 Cleanup", data=b"admin_cleanup")],
+            [Button.inline("📊 Stats", data=b"admin_stats"), Button.inline("🌐 Dashboard", data=b"admin_dashboard")],
+            [Button.inline("📥 Queue", data=b"admin_queue"), Button.inline("👥 Users", data=b"admin_users")],
+            [Button.inline("💾 Disk", data=b"admin_disk"), Button.inline("🌍 Public mode", data=b"admin_public")],
+            [Button.inline("🧹 Cleanup", data=b"admin_cleanup")],
         ],
         parse_mode="md",
     )
