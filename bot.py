@@ -83,7 +83,17 @@ health_app = Flask(__name__)
 
 @health_app.route("/")
 def index():
-    return f"{BOT_NAME} bot is running."
+    # Render primary URL now opens the full statistics website.
+    # If the dashboard is private, this route shows a small login page instead of plain text.
+    if DASHBOARD_ENABLED:
+        return _render_dashboard_or_login()
+    return Response(_status_page_html(), mimetype="text/html")
+
+
+@health_app.route("/favicon.ico")
+def favicon():
+    svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop stop-color='#29b6ff'/><stop offset='1' stop-color='#0b5cff'/></linearGradient></defs><rect width='64' height='64' rx='16' fill='url(#g)'/><path d='M18 22h28a4 4 0 0 1 4 4v20a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V26a4 4 0 0 1 4-4Z' fill='white' opacity='.95'/><path d='M20 44l9-10 7 7 5-6 8 9H20Z' fill='#0b5cff'/><path d='M32 10v22m0 0l-8-8m8 8l8-8' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/></svg>"""
+    return Response(svg, mimetype="image/svg+xml")
 
 
 @health_app.route("/health")
@@ -106,11 +116,14 @@ def api_stats():
 
 @health_app.route("/dashboard")
 def dashboard():
+    return _render_dashboard_or_login()
+
+
+def _render_dashboard_or_login():
     if not DASHBOARD_ENABLED:
-        return Response("Dashboard disabled", status=404)
+        return Response(_status_page_html("Dashboard disabled"), status=404, mimetype="text/html")
     if not _dashboard_allowed():
-        message = "Dashboard locked. Add DASHBOARD_SECRET in Render and open /dashboard?key=YOUR_SECRET, or set DASHBOARD_PUBLIC=true."
-        return Response(message, status=401, mimetype="text/plain")
+        return Response(_dashboard_login_html(), status=200, mimetype="text/html")
     return Response(_dashboard_html(_dashboard_payload()), mimetype="text/html")
 
 
@@ -203,81 +216,245 @@ def _card(title: str, value: str, sub: str = "") -> str:
     """
 
 
-def _dashboard_html(payload: dict) -> str:
-    users_rows = "".join(
-        f"<tr><td>{escape(str(u['user_id']))}</td><td>@{escape(u['username'] or '-')}</td><td>{escape(u['first_name'] or '-')}</td><td>{'Yes' if u['banned'] else 'No'}</td><td>{escape(u['last_seen'])}</td></tr>"
-        for u in payload["recent_users"]
-    ) or "<tr><td colspan='5'>No users yet</td></tr>"
-    events_rows = "".join(
-        f"<tr><td>{escape(str(e['user_id']))}</td><td>{escape(e['type'])}</td><td>{escape(e['detail'])}</td><td>{escape(e['created_at'])}</td></tr>"
-        for e in payload["recent_events"]
-    ) or "<tr><td colspan='4'>No events yet</td></tr>"
-    daily_rows = "".join(
-        f"<tr><td>{escape(d['day'])}</td><td>{d['files']}</td><td>{d['channels']}</td><td>{d['direct']}</td></tr>"
-        for d in payload["daily_usage"]
-    ) or "<tr><td colspan='4'>No daily usage yet</td></tr>"
-    job_rows = "".join(
-        f"<tr><td>{escape(str(j['user_id']))}</td><td>{escape(j['channel'])}</td><td>{escape(j['status'])}</td><td>{escape(j['phase'])}</td><td>{j['downloaded']}/{j['total'] or '?'}</td></tr>"
-        for j in payload["jobs"]
-    ) or "<tr><td colspan='5'>No active downloads</td></tr>"
-
-    cards = "".join([
-        _card("Unique users", payload["unique_users"], f"24h: {payload['active_users_24h']} • 7d: {payload['active_users_7d']}"),
-        _card("Downloaded files", payload["total_downloaded_files"], f"Today: {payload['today_downloaded_files']}"),
-        _card("Channel jobs", payload["total_channel_jobs"], f"Today: {payload['today_channel_jobs']}"),
-        _card("Direct URLs", payload["total_direct_urls"], f"Today: {payload['today_direct_urls']}"),
-        _card("Active jobs", f"{payload['active_jobs']}/{payload['max_active_jobs']}", payload["reader"]),
-        _card("Server", payload["status"], f"Uptime: {payload['uptime']}"),
-    ])
-
+def _status_page_html(message: str = "Bot is running") -> str:
     return f"""<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <meta http-equiv=\"refresh\" content=\"{DASHBOARD_REFRESH_SECONDS}\">
-  <title>{escape(payload['bot'])} Dashboard</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(BOT_NAME)} Status</title>
   <style>
-    :root {{ --bg:#07111f; --panel:#0e1b2e; --panel2:#13233a; --text:#eef6ff; --muted:#8ea4bd; --blue:#2aa7ff; --green:#37d67a; --border:#223750; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:linear-gradient(135deg,#06101d,#0a2442); color:var(--text); }}
-    .wrap {{ max-width:1180px; margin:0 auto; padding:28px 18px 60px; }}
-    .top {{ display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:22px; }}
-    h1 {{ margin:0; font-size:30px; letter-spacing:-0.5px; }}
-    .pill {{ display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border:1px solid var(--border); background:rgba(255,255,255,.04); border-radius:999px; color:var(--muted); }}
-    .dot {{ width:10px; height:10px; background:var(--green); border-radius:999px; box-shadow:0 0 12px var(--green); }}
-    .grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:18px; }}
-    .card {{ background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--border); border-radius:18px; padding:20px; box-shadow:0 14px 40px rgba(0,0,0,.22); }}
-    .label {{ color:var(--muted); font-size:14px; margin-bottom:10px; }}
-    .value {{ font-size:34px; font-weight:800; letter-spacing:-1px; }}
-    .sub {{ color:var(--muted); margin-top:8px; font-size:13px; min-height:18px; }}
-    .section {{ background:rgba(14,27,46,.84); border:1px solid var(--border); border-radius:18px; padding:18px; margin-top:16px; overflow:auto; }}
-    .section h2 {{ margin:0 0 14px; font-size:18px; }}
-    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-    th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); vertical-align:top; }}
-    th {{ color:#b6c9dd; font-weight:700; }}
-    td {{ color:#e8f2fb; }}
-    pre {{ white-space:pre-wrap; color:#c7d7e8; background:#07111f; border:1px solid var(--border); border-radius:12px; padding:12px; }}
-    a {{ color:var(--blue); }}
-    @media (max-width:800px) {{ .grid {{ grid-template-columns:1fr; }} .top {{ flex-direction:column; align-items:flex-start; }} }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:Inter,Segoe UI,Arial,sans-serif; background:linear-gradient(135deg,#06101d,#0a2442); color:#eef6ff; }}
+    .box {{ width:min(560px,92vw); background:rgba(14,27,46,.9); border:1px solid #223750; border-radius:24px; padding:28px; box-shadow:0 25px 80px rgba(0,0,0,.28); }}
+    h1 {{ margin:0 0 10px; }} p {{ color:#9db3c9; line-height:1.6; }} a {{ color:#2aa7ff; }}
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
-    <div class=\"top\">
-      <div>
-        <h1>📥 {escape(payload['bot'])} Dashboard</h1>
-        <div class=\"pill\"><span class=\"dot\"></span> Live on Render • auto refresh every {DASHBOARD_REFRESH_SECONDS}s</div>
-      </div>
-      <div class=\"pill\">Public mode: {escape(str(payload['public_mode']))}</div>
-    </div>
-    <div class=\"grid\">{cards}</div>
-    <div class=\"section\"><h2>Active downloads</h2><table><tr><th>User</th><th>Channel</th><th>Status</th><th>Phase</th><th>Files</th></tr>{job_rows}</table></div>
-    <div class=\"section\"><h2>Last 14 days</h2><table><tr><th>Day</th><th>Downloaded files</th><th>Channel jobs</th><th>Direct URLs</th></tr>{daily_rows}</table></div>
-    <div class=\"section\"><h2>Recent users</h2><table><tr><th>User ID</th><th>Username</th><th>Name</th><th>Banned</th><th>Last seen</th></tr>{users_rows}</table></div>
-    <div class=\"section\"><h2>Recent events</h2><table><tr><th>User ID</th><th>Type</th><th>Detail</th><th>Time</th></tr>{events_rows}</table></div>
-    <div class=\"section\"><h2>Disk</h2><pre>{escape(payload['disk_report'])}</pre></div>
+  <div class="box">
+    <h1>📥 {escape(BOT_NAME)}</h1>
+    <p>{escape(message)}</p>
+    <p>Open <a href="/dashboard">/dashboard</a> to view statistics.</p>
   </div>
+</body>
+</html>"""
+
+
+def _dashboard_login_html() -> str:
+    public_hint = "Set DASHBOARD_PUBLIC=true in Render if you want the root URL to show stats without a password."
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(BOT_NAME)} Dashboard Login</title>
+  <style>
+    :root {{ --bg:#07111f; --panel:#0e1b2e; --text:#eef6ff; --muted:#8ea4bd; --blue:#2aa7ff; --border:#223750; --danger:#ff5d6c; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:Inter,Segoe UI,Arial,sans-serif; background:radial-gradient(circle at 20% 20%,#123b68 0,#07111f 42%,#050b14 100%); color:var(--text); padding:18px; }}
+    .box {{ width:min(560px,100%); background:rgba(14,27,46,.92); border:1px solid var(--border); border-radius:26px; padding:28px; box-shadow:0 26px 100px rgba(0,0,0,.34); }}
+    .logo {{ width:68px;height:68px;border-radius:22px; display:grid; place-items:center; font-size:34px; background:linear-gradient(135deg,#29b6ff,#0b5cff); margin-bottom:16px; }}
+    h1 {{ margin:0 0 8px; font-size:28px; }}
+    p {{ color:var(--muted); line-height:1.6; margin:0 0 18px; }}
+    label {{ display:block; color:#c7d7e8; margin-bottom:8px; font-weight:700; }}
+    input {{ width:100%; border:1px solid var(--border); background:#07111f; color:var(--text); border-radius:14px; padding:14px 15px; font-size:15px; outline:none; }}
+    button {{ width:100%; margin-top:14px; border:0; border-radius:14px; padding:14px 16px; background:linear-gradient(135deg,#2aa7ff,#0b5cff); color:white; font-size:16px; font-weight:800; cursor:pointer; }}
+    .hint {{ margin-top:16px; font-size:13px; color:var(--muted); }}
+    .err {{ color:var(--danger); min-height:20px; margin-top:12px; font-size:14px; }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="logo">📊</div>
+    <h1>{escape(BOT_NAME)} Dashboard</h1>
+    <p>This dashboard is private. Enter your <b>DASHBOARD_SECRET</b> from Render to view live bot statistics.</p>
+    <label for="key">Dashboard secret</label>
+    <input id="key" type="password" placeholder="Paste DASHBOARD_SECRET here" autocomplete="off">
+    <button onclick="openDashboard()">Open Dashboard</button>
+    <div id="err" class="err"></div>
+    <div class="hint">{escape(public_hint)}</div>
+  </div>
+  <script>
+    const existing = localStorage.getItem('dashboardKey');
+    if (existing) document.getElementById('key').value = existing;
+    function openDashboard() {{
+      const key = document.getElementById('key').value.trim();
+      if (!key) {{ document.getElementById('err').textContent = 'Enter your DASHBOARD_SECRET first.'; return; }}
+      localStorage.setItem('dashboardKey', key);
+      window.location.href = '/dashboard?key=' + encodeURIComponent(key);
+    }}
+    document.getElementById('key').addEventListener('keydown', (e) => {{ if (e.key === 'Enter') openDashboard(); }});
+  </script>
+</body>
+</html>"""
+
+
+def _dashboard_html(payload: dict) -> str:
+    # Full self-contained HTML/CSS/JS dashboard.
+    # It is served at both / and /dashboard, so the Render primary URL opens the stats website.
+    initial_json = escape(__import__('json').dumps(payload), quote=False)
+    refresh_ms = max(3, int(DASHBOARD_REFRESH_SECONDS or 15)) * 1000
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(payload['bot'])} Dashboard</title>
+  <style>
+    :root {{
+      --bg:#07111f; --panel:#0e1b2e; --panel2:#13233a; --text:#eef6ff; --muted:#8ea4bd;
+      --blue:#2aa7ff; --blue2:#0b5cff; --green:#37d67a; --yellow:#f8c23a; --red:#ff5d6c; --border:#223750;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter,Segoe UI,Arial,sans-serif; background:linear-gradient(135deg,#06101d,#0a2442 55%,#06101d); color:var(--text); }}
+    .wrap {{ max-width:1240px; margin:0 auto; padding:26px 18px 58px; }}
+    .hero {{ display:flex; justify-content:space-between; gap:18px; align-items:center; margin-bottom:20px; }}
+    .brand {{ display:flex; gap:14px; align-items:center; }}
+    .logo {{ width:62px; height:62px; border-radius:20px; display:grid; place-items:center; background:linear-gradient(135deg,var(--blue),var(--blue2)); box-shadow:0 16px 42px rgba(42,167,255,.28); font-size:30px; }}
+    h1 {{ margin:0 0 6px; font-size:31px; letter-spacing:-.6px; }}
+    .muted {{ color:var(--muted); }}
+    .toolbar {{ display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; }}
+    .pill,.btn {{ display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border:1px solid var(--border); background:rgba(255,255,255,.05); border-radius:999px; color:#c7d7e8; text-decoration:none; font-weight:700; }}
+    .btn {{ cursor:pointer; }}
+    .btn:hover {{ border-color:var(--blue); color:white; }}
+    .dot {{ width:10px; height:10px; background:var(--green); border-radius:999px; box-shadow:0 0 12px var(--green); }}
+    .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; margin-bottom:16px; }}
+    .card {{ position:relative; overflow:hidden; background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--border); border-radius:20px; padding:19px; box-shadow:0 14px 40px rgba(0,0,0,.24); }}
+    .card::after {{ content:''; position:absolute; right:-28px; top:-30px; width:95px; height:95px; border-radius:999px; background:rgba(42,167,255,.10); }}
+    .label {{ color:var(--muted); font-size:13px; margin-bottom:10px; position:relative; z-index:1; }}
+    .value {{ font-size:33px; font-weight:900; letter-spacing:-1px; position:relative; z-index:1; }}
+    .sub {{ color:var(--muted); margin-top:8px; font-size:13px; min-height:18px; position:relative; z-index:1; }}
+    .section {{ background:rgba(14,27,46,.86); border:1px solid var(--border); border-radius:20px; padding:18px; margin-top:16px; overflow:auto; box-shadow:0 12px 38px rgba(0,0,0,.18); }}
+    .section h2 {{ margin:0 0 14px; font-size:18px; }}
+    .two {{ display:grid; grid-template-columns:1.15fr .85fr; gap:16px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+    th,td {{ text-align:left; padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); vertical-align:top; }}
+    th {{ color:#b6c9dd; font-weight:800; }}
+    td {{ color:#e8f2fb; }}
+    pre {{ white-space:pre-wrap; color:#c7d7e8; background:#07111f; border:1px solid var(--border); border-radius:14px; padding:12px; margin:0; }}
+    .statusLine {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }}
+    .small {{ font-size:12px; color:var(--muted); }}
+    .ok {{ color:var(--green); }} .warn {{ color:var(--yellow); }} .bad {{ color:var(--red); }}
+    .bar {{ height:10px; background:#07111f; border:1px solid var(--border); border-radius:999px; overflow:hidden; margin-top:10px; }}
+    .bar > div {{ height:100%; width:0%; background:linear-gradient(90deg,var(--blue),var(--green)); transition:width .25s ease; }}
+    @media (max-width:1000px) {{ .grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .two {{ grid-template-columns:1fr; }} }}
+    @media (max-width:700px) {{ .grid {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} .toolbar {{ justify-content:flex-start; }} h1 {{ font-size:25px; }} }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div class="brand">
+        <div class="logo">📥</div>
+        <div>
+          <h1 id="title">{escape(payload['bot'])} Dashboard</h1>
+          <div class="muted">Live statistics website for your Telegram bot</div>
+          <div class="statusLine">
+            <span class="pill"><span class="dot"></span><span id="onlineText">Online</span></span>
+            <span class="pill">Last update: <span id="lastUpdate">now</span></span>
+          </div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="btn" onclick="loadStats(true)">↻ Refresh</button>
+        <a class="btn" href="/health" target="_blank">Health</a>
+        <a class="btn" href="/api/stats" id="apiLink" target="_blank">API</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="label">Unique users</div><div class="value" id="unique_users">0</div><div class="sub" id="active_users">24h: 0 • 7d: 0</div></div>
+      <div class="card"><div class="label">Downloaded files</div><div class="value" id="total_downloaded_files">0</div><div class="sub" id="today_downloaded_files">Today: 0</div></div>
+      <div class="card"><div class="label">Channel jobs</div><div class="value" id="total_channel_jobs">0</div><div class="sub" id="today_channel_jobs">Today: 0</div></div>
+      <div class="card"><div class="label">Direct URL downloads</div><div class="value" id="total_direct_urls">0</div><div class="sub" id="today_direct_urls">Today: 0</div></div>
+      <div class="card"><div class="label">Active jobs</div><div class="value" id="active_jobs">0</div><div class="sub" id="active_jobs_sub">Max: 0</div></div>
+      <div class="card"><div class="label">Server status</div><div class="value" id="status">online</div><div class="sub" id="uptime">Uptime: -</div></div>
+      <div class="card"><div class="label">Public mode</div><div class="value" id="public_mode">-</div><div class="sub" id="reader">Reader: -</div></div>
+      <div class="card"><div class="label">Downloads folder</div><div class="value" id="downloads_folder_size">0 B</div><div class="sub">Temporary storage usage</div></div>
+    </div>
+
+    <div class="section"><h2>Active downloads</h2><table><thead><tr><th>User</th><th>Channel</th><th>Status</th><th>Phase</th><th>Files</th><th>Progress</th></tr></thead><tbody id="jobsRows"></tbody></table></div>
+
+    <div class="two">
+      <div class="section"><h2>Last 14 days</h2><table><thead><tr><th>Day</th><th>Downloaded files</th><th>Channel jobs</th><th>Direct URLs</th></tr></thead><tbody id="dailyRows"></tbody></table></div>
+      <div class="section"><h2>Disk</h2><pre id="diskReport">Loading...</pre></div>
+    </div>
+
+    <div class="section"><h2>Recent users</h2><table><thead><tr><th>User ID</th><th>Username</th><th>Name</th><th>Banned</th><th>Last seen</th></tr></thead><tbody id="usersRows"></tbody></table></div>
+    <div class="section"><h2>Recent events</h2><table><thead><tr><th>User ID</th><th>Type</th><th>Detail</th><th>Time</th></tr></thead><tbody id="eventsRows"></tbody></table></div>
+    <p class="small">This page refreshes automatically every {int(refresh_ms/1000)} seconds using JavaScript.</p>
+  </div>
+
+  <script id="initial" type="application/json">{initial_json}</script>
+  <script>
+    const refreshMs = {refresh_ms};
+    const params = new URLSearchParams(location.search);
+    const keyFromUrl = params.get('key') || '';
+    if (keyFromUrl) localStorage.setItem('dashboardKey', keyFromUrl);
+    const dashboardKey = keyFromUrl || localStorage.getItem('dashboardKey') || '';
+    const apiUrl = '/api/stats' + (dashboardKey ? ('?key=' + encodeURIComponent(dashboardKey)) : '');
+    document.getElementById('apiLink').href = apiUrl;
+
+    function esc(v) {{ return String(v ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+    function set(id, value) {{ const el = document.getElementById(id); if (el) el.textContent = value; }}
+    function int(v) {{ return Number(v || 0).toLocaleString(); }}
+    function row(html, colspan) {{ return html || `<tr><td colspan="${{colspan}}">No data yet</td></tr>`; }}
+
+    function render(data) {{
+      set('title', `${{data.bot || 'PhotoSnatcher'}} Dashboard`);
+      set('unique_users', int(data.unique_users));
+      set('active_users', `24h: ${{int(data.active_users_24h)}} • 7d: ${{int(data.active_users_7d)}}`);
+      set('total_downloaded_files', int(data.total_downloaded_files));
+      set('today_downloaded_files', `Today: ${{int(data.today_downloaded_files)}}`);
+      set('total_channel_jobs', int(data.total_channel_jobs));
+      set('today_channel_jobs', `Today: ${{int(data.today_channel_jobs)}}`);
+      set('total_direct_urls', int(data.total_direct_urls));
+      set('today_direct_urls', `Today: ${{int(data.today_direct_urls)}}`);
+      set('active_jobs', `${{int(data.active_jobs)}}/${{int(data.max_active_jobs)}}`);
+      set('active_jobs_sub', `Reader: ${{data.reader || '-'}}`);
+      set('status', data.status || 'online');
+      set('uptime', `Uptime: ${{data.uptime || '-'}}`);
+      set('public_mode', String(data.public_mode));
+      set('reader', `Reader: ${{data.reader || '-'}}`);
+      set('downloads_folder_size', data.downloads_folder_size || '0 B');
+      set('diskReport', data.disk_report || 'No disk report');
+      set('lastUpdate', new Date().toLocaleTimeString());
+      document.getElementById('onlineText').textContent = 'Online';
+
+      const jobs = (data.jobs || []).map(j => {{
+        const total = Number(j.total || 0);
+        const downloaded = Number(j.downloaded || 0);
+        const pct = total ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+        return `<tr><td>${{esc(j.user_id)}}</td><td>${{esc(j.channel)}}</td><td>${{esc(j.status)}}</td><td>${{esc(j.phase)}}</td><td>${{int(downloaded)}}/${{total ? int(total) : '?'}}</td><td><div class="bar"><div style="width:${{pct}}%"></div></div><span class="small">${{pct}}%</span></td></tr>`;
+      }}).join('');
+      document.getElementById('jobsRows').innerHTML = row(jobs, 6);
+
+      const daily = (data.daily_usage || []).map(d => `<tr><td>${{esc(d.day)}}</td><td>${{int(d.files)}}</td><td>${{int(d.channels)}}</td><td>${{int(d.direct)}}</td></tr>`).join('');
+      document.getElementById('dailyRows').innerHTML = row(daily, 4);
+
+      const users = (data.recent_users || []).map(u => `<tr><td>${{esc(u.user_id)}}</td><td>@${{esc(u.username || '-')}}</td><td>${{esc(u.first_name || '-')}}</td><td>${{u.banned ? '<span class="bad">Yes</span>' : '<span class="ok">No</span>'}}</td><td>${{esc(u.last_seen || '-')}}</td></tr>`).join('');
+      document.getElementById('usersRows').innerHTML = row(users, 5);
+
+      const events = (data.recent_events || []).map(e => `<tr><td>${{esc(e.user_id)}}</td><td>${{esc(e.type)}}</td><td>${{esc(e.detail)}}</td><td>${{esc(e.created_at)}}</td></tr>`).join('');
+      document.getElementById('eventsRows').innerHTML = row(events, 4);
+    }}
+
+    async function loadStats(manual=false) {{
+      try {{
+        const res = await fetch(apiUrl, {{ cache: 'no-store' }});
+        if (!res.ok) throw new Error('Dashboard API locked or unavailable: ' + res.status);
+        const data = await res.json();
+        render(data);
+      }} catch (err) {{
+        document.getElementById('onlineText').textContent = 'Connection problem';
+        console.error(err);
+        if (manual) alert(err.message);
+      }}
+    }}
+
+    try {{ render(JSON.parse(document.getElementById('initial').textContent)); }} catch (e) {{}}
+    loadStats(false);
+    setInterval(loadStats, refreshMs);
+  </script>
 </body>
 </html>"""
 
